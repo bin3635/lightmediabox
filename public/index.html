@@ -21,7 +21,7 @@
         };
     </script>
     <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
-    <link rel="stylesheet" href="styles.css?v=7">
+    <link rel="stylesheet" href="styles.css?v=9">
 </head>
 
 <body>
@@ -98,6 +98,7 @@
                 <div class="settings-tabs">
                     <button class="settings-tab active" data-target="settings-account">계정</button>
                     <button class="settings-tab" data-target="settings-library">라이브러리</button>
+                    <button class="settings-tab" data-target="settings-ffmpeg">FFmpeg</button>
                     <button class="settings-tab" data-target="settings-transcoding">트랜스코딩</button>
                     <button class="settings-tab" data-target="settings-speedtest">속도 측정</button>
                 </div>
@@ -172,6 +173,78 @@
                         <div style="margin-top: 24px;">
                             <button class="btn-primary btn-settings-save">변경사항 저장</button>
                         </div>
+                    </div>
+                </div>
+
+                <!-- FFmpeg 설정 패널 -->
+                <div id="settings-ffmpeg" class="settings-pane">
+                    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 16px;">
+                        <h3 style="margin: 0;">FFmpeg 관리</h3>
+                        <span id="ffmpeg-status-badge" class="ffmpeg-badge badge-checking">확인 중...</span>
+                    </div>
+
+                    <div style="font-size: 13px; color: rgba(255,255,255,0.6); line-height: 1.5; margin-bottom: 20px;">
+                        LightMediaBox의 미디어 스트리밍 및 하드웨어 가속에 최적화된 <strong>Jellyfin-FFmpeg</strong> 인코더를 관리합니다.
+                    </div>
+
+                    <div class="ffmpeg-card">
+                        <div class="ffmpeg-source-row" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid rgba(255, 255, 255, 0.06);">
+                            <span style="font-size: 12px; color: rgba(255, 255, 255, 0.45); display: flex; align-items: center; gap: 6px;">
+                                <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor" style="color: #a78bfa; flex-shrink: 0;">
+                                    <path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h16v2H4z"/>
+                                </svg>
+                                설치 출처
+                            </span>
+                            <span id="ffmpeg-source-badge" class="ffmpeg-source-tag source-local" style="align-self: flex-start;">
+                                조회 중...
+                            </span>
+                        </div>
+
+                        <div class="ffmpeg-info-grid">
+                            <div class="ffmpeg-info-item">
+                                <label>현재 설치 버전</label>
+                                <div id="ffmpeg-current-version" class="ffmpeg-version-text">-</div>
+                            </div>
+                            <div class="ffmpeg-info-item">
+                                <label>최신 릴리스 버전</label>
+                                <div id="ffmpeg-latest-version" class="ffmpeg-version-text">-</div>
+                            </div>
+                        </div>
+
+                        <div class="form-group" style="margin-top: 16px;">
+                            <label>바이너리 실행 파일 경로</label>
+                            <input type="text" id="ffmpeg-current-path" disabled class="auth-input" style="background: rgba(0,0,0,0.25); color: #cbd5e1; font-family: monospace; font-size: 12px;" value="조회 중...">
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 10px; margin-top: 20px;">
+                        <button id="btn-ffmpeg-check" class="btn-secondary" style="display: flex; align-items: center; gap: 6px;">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                                <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/>
+                            </svg>
+                            업데이트 확인
+                        </button>
+                        <button id="btn-ffmpeg-update" class="btn-primary" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;" disabled>
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+                                <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM17 13l-5 5-5-5h3V9h4v4h3z"/>
+                            </svg>
+                            <span id="btn-ffmpeg-update-text">FFmpeg 업데이트</span>
+                        </button>
+                    </div>
+
+                    <!-- 업데이트 진행 상태 표시 박스 -->
+                    <div id="ffmpeg-progress-container" class="ffmpeg-progress-box" style="display: none; margin-top: 20px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                            <span id="ffmpeg-progress-status" style="font-size: 13px; color: #a78bfa; font-weight: 500;">다운로드 준비 중...</span>
+                            <span id="ffmpeg-progress-percent" style="font-size: 13px; color: #fff; font-weight: bold;">0%</span>
+                        </div>
+                        <div class="ffmpeg-progress-bar-wrap">
+                            <div id="ffmpeg-progress-bar" class="ffmpeg-progress-bar" style="width: 0%;"></div>
+                        </div>
+                    </div>
+
+                    <div style="margin-top: 20px; padding: 12px 14px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; font-size: 12px; color: rgba(255,255,255,0.45); line-height: 1.5;">
+                        💡 <strong>알림:</strong> Jellyfin-FFmpeg는 Intel QSV, NVIDIA NVENC, AMD AMF 등 최신 GPU 하드웨어 가속 코덱 패치가 통합되어 고화질 영상을 지연 없이 트랜스코딩할 수 있습니다.
                     </div>
                 </div>
 
@@ -452,7 +525,7 @@
         </div>
     </div>
 
-    <script src="main.js?v=17"></script>
+    <script src="main.js?v=19"></script>
 </body>
 
 </html>

@@ -1482,3 +1482,119 @@ google-cast-launcher { --connected-color: #fff; --disconnected-color: #fff; widt
 #btn-fullscreen {
     margin-right: -6px; /* 우측 여백 밸런스 조정 */
 }
+
+/* ─── FFmpeg 관리 탭 스타일 ─── */
+.ffmpeg-card {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    padding: 16px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.ffmpeg-info-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+.ffmpeg-info-item {
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.ffmpeg-info-item label {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.5);
+    display: block;
+    margin-bottom: 6px;
+}
+
+.ffmpeg-version-text {
+    font-size: 18px;
+    font-weight: 700;
+    color: #fff;
+    font-family: 'SF Mono', Consolas, Monaco, monospace;
+}
+
+.ffmpeg-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.ffmpeg-badge.badge-up-to-date {
+    background: rgba(16, 185, 129, 0.15);
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    color: #34d399;
+}
+
+.ffmpeg-badge.badge-update-available {
+    background: rgba(245, 158, 11, 0.15);
+    border: 1px solid rgba(245, 158, 11, 0.4);
+    color: #fbbf24;
+}
+
+.ffmpeg-badge.badge-checking {
+    background: rgba(139, 92, 246, 0.15);
+    border: 1px solid rgba(139, 92, 246, 0.4);
+    color: #c084fc;
+}
+
+.ffmpeg-badge.badge-error {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    color: #f87171;
+}
+
+.ffmpeg-progress-box {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(139, 92, 246, 0.3);
+    border-radius: 8px;
+    padding: 14px;
+}
+
+.ffmpeg-progress-bar-wrap {
+    width: 100%;
+    height: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.ffmpeg-progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #8b5cf6, #c084fc);
+    border-radius: 4px;
+    transition: width 0.3s ease;
+}
+
+.ffmpeg-source-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+.ffmpeg-source-tag.source-system {
+    background: rgba(59, 130, 246, 0.15);
+    border: 1px solid rgba(59, 130, 246, 0.4);
+    color: #60a5fa;
+}
+
+.ffmpeg-source-tag.source-local {
+    background: rgba(139, 92, 246, 0.15);
+    border: 1px solid rgba(139, 92, 246, 0.4);
+    color: #c084fc;
+}
+
+

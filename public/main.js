@@ -1177,6 +1177,10 @@ settingsTabs.forEach(tab => {
 
         tab.classList.add('active');
         document.getElementById(tab.dataset.target).classList.add('active');
+
+        if (tab.dataset.target === 'settings-ffmpeg') {
+            loadFfmpegSettings();
+        }
     });
 });
 
@@ -1392,15 +1396,199 @@ async function loadTranscoderSettings() {
     }
 }
 
+// ─── FFmpeg 관리 로직 ───
+let ffmpegUpdatePollingTimer = null;
+
+async function loadFfmpegSettings(forceCheck = false) {
+    const currentVersionEl = document.getElementById('ffmpeg-current-version');
+    const latestVersionEl = document.getElementById('ffmpeg-latest-version');
+    const pathInput = document.getElementById('ffmpeg-current-path');
+    const statusBadge = document.getElementById('ffmpeg-status-badge');
+    const btnCheck = document.getElementById('btn-ffmpeg-check');
+    const btnUpdate = document.getElementById('btn-ffmpeg-update');
+    const btnUpdateText = document.getElementById('btn-ffmpeg-update-text');
+
+    if (!currentVersionEl) return;
+
+    try {
+        if (forceCheck) {
+            statusBadge.className = 'ffmpeg-badge badge-checking';
+            statusBadge.innerText = '확인 중...';
+            if (btnCheck) btnCheck.disabled = true;
+        }
+
+        const endpoint = forceCheck ? '/api/settings/ffmpeg/check' : '/api/settings/ffmpeg';
+        const res = await fetch(endpoint, {
+            method: forceCheck ? 'POST' : 'GET'
+        });
+        const data = await res.json();
+
+        const current = data.current || {};
+        const latest = data.latest || {};
+        const updateState = data.updateState || {};
+
+        currentVersionEl.innerText = current.installed ? (current.tag || `v${current.version}`) : '미설치';
+        latestVersionEl.innerText = latest.releaseTag || (latest.latestVersion ? `v${latest.latestVersion}` : '-');
+        if (pathInput) pathInput.value = current.path || '';
+
+        const sourceBadge = document.getElementById('ffmpeg-source-badge');
+        if (sourceBadge) {
+            if (current.sourceType === 'system') {
+                sourceBadge.className = 'ffmpeg-source-tag source-system';
+                sourceBadge.innerHTML = '📦 리눅스 시스템 패키지 매니저 (APT 등)';
+            } else if (current.sourceType === 'local') {
+                sourceBadge.className = 'ffmpeg-source-tag source-local';
+                sourceBadge.innerHTML = '⚡ LightMediaBox 직접 다운로드 (포터블)';
+            } else {
+                sourceBadge.className = 'ffmpeg-source-tag';
+                sourceBadge.innerText = current.sourceLabel || '미설치';
+            }
+        }
+
+        // 상태 뱃지 및 업데이트 버튼 활성화 처리
+        if (updateState.isUpdating) {
+            statusBadge.className = 'ffmpeg-badge badge-checking';
+            statusBadge.innerText = '업데이트 진행 중';
+            if (btnUpdate) btnUpdate.disabled = true;
+            if (btnUpdateText) btnUpdateText.innerText = '업데이트 중...';
+            showFfmpegProgress(updateState);
+            startFfmpegPolling();
+        } else if (latest.hasUpdate) {
+            statusBadge.className = 'ffmpeg-badge badge-update-available';
+            statusBadge.innerText = `업데이트 가능 (${latest.releaseTag || latest.latestVersion})`;
+            if (btnUpdate) btnUpdate.disabled = false;
+            if (btnUpdateText) btnUpdateText.innerText = `v${latest.latestVersion}로 업데이트`;
+        } else if (current.installed) {
+            statusBadge.className = 'ffmpeg-badge badge-up-to-date';
+            statusBadge.innerText = '최신 버전 사용 중';
+            if (btnUpdate) btnUpdate.disabled = false;
+            if (btnUpdateText) btnUpdateText.innerText = '최신 버전 재설치';
+        } else {
+            statusBadge.className = 'ffmpeg-badge badge-error';
+            statusBadge.innerText = '미설치';
+            if (btnUpdate) btnUpdate.disabled = false;
+            if (btnUpdateText) btnUpdateText.innerText = 'FFmpeg 설치하기';
+        }
+
+        if (forceCheck) {
+            showToast('최신 버전 정보를 확인했습니다.', 'success');
+        }
+    } catch (err) {
+        console.error('FFmpeg 정보 로드 오류:', err);
+        if (statusBadge) {
+            statusBadge.className = 'ffmpeg-badge badge-error';
+            statusBadge.innerText = '조회 실패';
+        }
+        if (forceCheck) {
+            showToast('최신 버전 확인에 실패했습니다.', 'error');
+        }
+    } finally {
+        if (btnCheck) btnCheck.disabled = false;
+    }
+}
+
+function showFfmpegProgress(state) {
+    const container = document.getElementById('ffmpeg-progress-container');
+    const statusEl = document.getElementById('ffmpeg-progress-status');
+    const percentEl = document.getElementById('ffmpeg-progress-percent');
+    const barEl = document.getElementById('ffmpeg-progress-bar');
+
+    if (!container) return;
+    container.style.display = 'block';
+    if (statusEl) statusEl.innerText = state.message || '진행 중...';
+    if (percentEl) percentEl.innerText = `${state.percent || 0}%`;
+    if (barEl) barEl.style.width = `${state.percent || 0}%`;
+}
+
+function hideFfmpegProgress() {
+    const container = document.getElementById('ffmpeg-progress-container');
+    if (container) {
+        container.style.display = 'none';
+    }
+}
+
+function startFfmpegPolling() {
+    if (ffmpegUpdatePollingTimer) return;
+
+    ffmpegUpdatePollingTimer = setInterval(async () => {
+        try {
+            const res = await fetch('/api/settings/ffmpeg/progress');
+            const state = await res.json();
+
+            showFfmpegProgress(state);
+
+            if (!state.isUpdating) {
+                clearInterval(ffmpegUpdatePollingTimer);
+                ffmpegUpdatePollingTimer = null;
+
+                if (state.step === 'completed') {
+                    showToast(state.message || 'FFmpeg 업데이트가 완료되었습니다!', 'success');
+                    setTimeout(() => {
+                        hideFfmpegProgress();
+                    }, 3000);
+                } else if (state.step === 'error') {
+                    showToast(state.error || 'FFmpeg 업데이트 중 오류가 발생했습니다.', 'error');
+                }
+                loadFfmpegSettings();
+            }
+        } catch (err) {
+            console.error('진행 상태 폴링 오류:', err);
+        }
+    }, 600);
+}
+
+// FFmpeg 관련 이벤트 바인딩
+const btnFfmpegCheck = document.getElementById('btn-ffmpeg-check');
+const btnFfmpegUpdate = document.getElementById('btn-ffmpeg-update');
+
+if (btnFfmpegCheck) {
+    btnFfmpegCheck.onclick = () => {
+        loadFfmpegSettings(true);
+    };
+}
+
+if (btnFfmpegUpdate) {
+    btnFfmpegUpdate.onclick = async () => {
+        const btnUpdateText = document.getElementById('btn-ffmpeg-update-text');
+        try {
+            btnFfmpegUpdate.disabled = true;
+            if (btnFfmpegCheck) btnFfmpegCheck.disabled = true;
+            if (btnUpdateText) btnUpdateText.innerText = '업데이트 시작 중...';
+
+            showFfmpegProgress({
+                percent: 0,
+                message: '업데이트 요청 중...'
+            });
+
+            const res = await fetch('/api/settings/ffmpeg/update', { method: 'POST' });
+            const data = await res.json();
+
+            if (!res.ok) {
+                throw new Error(data.error || '업데이트 요청에 실패했습니다.');
+            }
+
+            startFfmpegPolling();
+        } catch (err) {
+            console.error('업데이트 시작 실패:', err);
+            showToast(err.message || '업데이트를 시작할 수 없습니다.', 'error');
+            hideFfmpegProgress();
+            btnFfmpegUpdate.disabled = false;
+            if (btnFfmpegCheck) btnFfmpegCheck.disabled = false;
+            loadFfmpegSettings();
+        }
+    };
+}
+
 btnSettings.onclick = async () => {
     try {
         const res = await fetch('/api/config');
         const config = await res.json();
         inputMediaDir.value = config.mediaDir || '';
 
-        // 설정 창 열릴 때 계정 정보 및 트랜스코딩 정보 로드
+        // 설정 창 열릴 때 계정 정보, 트랜스코딩 정보, FFmpeg 정보 로드
         loadAccountInfo();
         loadTranscoderSettings();
+        loadFfmpegSettings();
 
         settingsModal.classList.add('visible');
     } catch (err) {

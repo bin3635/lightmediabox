@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import { VideoRecord } from './types';
 import { getConfig, saveConfig } from './config';
 import { startScanner, stopScanner } from './scanner';
-import { getFfmpegPath, getFfprobePath } from './setup-ffmpeg';
+import { getFfmpegPath, getFfprobePath, getFfmpegInfo, checkLatestRelease, updateFfmpeg, getUpdateState } from './setup-ffmpeg';
 
 const router = express.Router();
 ffmpeg.setFfmpegPath(getFfmpegPath());
@@ -225,6 +225,58 @@ router.put('/settings/transcoder', (req, res) => {
         console.error(e);
         res.status(500).json({ error: '설정 저장 중 오류가 발생했습니다.' });
     }
+});
+
+// ─── API: FFmpeg 상태 및 버전 정보 조회 ───
+router.get('/settings/ffmpeg', async (req, res) => {
+    try {
+        const current = getFfmpegInfo();
+        const latest = await checkLatestRelease(false);
+        const updateState = getUpdateState();
+        res.json({ current, latest, updateState });
+    } catch (e: any) {
+        console.error('FFmpeg 정보 조회 실패:', e);
+        res.status(500).json({ error: 'FFmpeg 정보를 불러오지 못했습니다.' });
+    }
+});
+
+// ─── API: FFmpeg 최신 버전 강제 확인 ───
+router.post('/settings/ffmpeg/check', async (req, res) => {
+    try {
+        const current = getFfmpegInfo();
+        const latest = await checkLatestRelease(true);
+        const updateState = getUpdateState();
+        res.json({ current, latest, updateState });
+    } catch (e: any) {
+        console.error('FFmpeg 최신 버전 확인 실패:', e);
+        res.status(500).json({ error: '최신 버전 정보를 확인하지 못했습니다.' });
+    }
+});
+
+// ─── API: FFmpeg 업데이트 실행 ───
+router.post('/settings/ffmpeg/update', async (req, res) => {
+    try {
+        const currentState = getUpdateState();
+        if (currentState.isUpdating) {
+            return res.status(409).json({ error: '이미 업데이트가 진행 중입니다.' });
+        }
+
+        // 비동기로 업데이트 진행 시작
+        updateFfmpeg().catch(err => {
+            console.error('FFmpeg 백그라운드 업데이트 오류:', err);
+        });
+
+        res.json({ success: true, message: 'FFmpeg 업데이트가 시작되었습니다.' });
+    } catch (e: any) {
+        console.error('FFmpeg 업데이트 시작 실패:', e);
+        res.status(500).json({ error: e.message || '업데이트를 시작하지 못했습니다.' });
+    }
+});
+
+// ─── API: FFmpeg 업데이트 진행 상태 조회 ───
+router.get('/settings/ffmpeg/progress', (req, res) => {
+    const state = getUpdateState();
+    res.json(state);
 });
 
 router.get('/system-browse', (req, res) => {
