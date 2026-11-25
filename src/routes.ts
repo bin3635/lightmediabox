@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import { VideoRecord } from './types';
 import { getConfig, saveConfig } from './config';
 import { startScanner, stopScanner } from './scanner';
-import { getFfmpegPath, getFfprobePath, getFfmpegInfo, checkLatestRelease, updateFfmpeg, getUpdateState } from './setup-ffmpeg';
+import { getFfmpegPath, getFfprobePath, getFfmpegInfo, checkLatestRelease, updateFfmpeg, getUpdateState, onFfmpegUpdated } from './setup-ffmpeg';
 
 const router = express.Router();
 ffmpeg.setFfmpegPath(getFfmpegPath());
@@ -32,23 +32,232 @@ const SESSION_TIMEOUT_MS = 5 * 60 * 1000;
 
 const getStreamKey = (id: string, quality: string) => `${id}_${quality}`;
 
+type TranscoderCodec =
+    | 'libx264'
+    | 'h264_nvenc'
+    | 'h264_amf'
+    | 'h264_vaapi'
+    | 'h264_qsv';
+
+interface EncoderProbeResult {
+    id: TranscoderCodec;
+    available: boolean;
+    osSupported: boolean;
+    device?: string;
+    reason?: string;
+}
+
+const SUPPORTED_ENCODERS: TranscoderCodec[] = [
+    'libx264',
+    'h264_nvenc',
+    'h264_amf',
+    'h264_vaapi',
+    'h264_qsv',
+];
+
+const ENCODER_OS_SUPPORT: Record<TranscoderCodec, NodeJS.Platform[]> = {
+    libx264: ['win32', 'linux', 'darwin'],
+    h264_nvenc: ['win32', 'linux'],
+    h264_amf: ['win32', 'linux'],
+    h264_vaapi: ['linux'],
+    h264_qsv: ['win32', 'linux'],
+};
+
+const getLinuxRenderDevices = (): string[] => {
+    if (os.platform() !== 'linux') return [];
+    const envDev = process.env.DRI_RENDER_DEVICE;
+    const devices: string[] = [];
+    if (envDev && fs.existsSync(envDev)) devices.push(envDev);
+    try {
+        if (fs.existsSync('/dev/dri')) {
+            const entries = fs.readdirSync('/dev/dri')
+                .filter(name => /^renderD\d+$/.test(name))
+                .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+                .map(name => `/dev/dri/${name}`);
+            for (const dev of entries) {
+                if (!devices.includes(dev)) devices.push(dev);
+            }
+        }
+    } catch (e) {}
+    return devices;
+};
+
 let availableEncoders: Set<string> | null = null;
-const checkEncoder = async (codec: string): Promise<boolean> => {
-    if (codec === 'copy' || codec === 'libx264') return true;
+const encoderProbeCache = new Map<TranscoderCodec, EncoderProbeResult>();
+const detectedRenderDevices: Partial<Record<'h264_vaapi' | 'h264_qsv', string>> = {};
+let probeAllInFlight: Promise<EncoderProbeResult[]> | null = null;
+
+const clearEncoderCache = () => {
+    availableEncoders = null;
+    encoderProbeCache.clear();
+    delete detectedRenderDevices.h264_vaapi;
+    delete detectedRenderDevices.h264_qsv;
+    probeAllInFlight = null;
+    ffmpeg.setFfmpegPath(getFfmpegPath());
+    ffmpeg.setFfprobePath(getFfprobePath());
+};
+
+onFfmpegUpdated(clearEncoderCache);
+
+const getCompiledEncoders = (): Promise<Set<string>> => {
     return new Promise((resolve) => {
-        if (availableEncoders) return resolve(availableEncoders.has(codec));
+        if (availableEncoders) return resolve(availableEncoders);
         ffmpeg.getAvailableEncoders((err, encoders) => {
             if (err || !encoders) {
                 console.error('인코더 목록 조회 실패:', err?.message);
-                return resolve(false);
+                return resolve(new Set());
             }
-            availableEncoders = new Set();
-            for (const key in encoders) {
-                availableEncoders.add(key);
-            }
-            resolve(availableEncoders.has(codec));
+            availableEncoders = new Set(Object.keys(encoders));
+            resolve(availableEncoders);
         });
     });
+};
+
+const runFfmpegProbe = (args: string[]): Promise<{ ok: boolean; error: string }> => {
+    return new Promise((resolve) => {
+        cp.execFile(getFfmpegPath(), args, { timeout: 5000 }, (err, _stdout, stderr) => {
+            if (!err) return resolve({ ok: true, error: '' });
+            const msg = (stderr || err.message || '').split(/\r?\n/).map(s => s.trim()).find(Boolean) || '초기화 실패';
+            resolve({ ok: false, error: msg.trim() });
+        });
+    });
+};
+
+const probeEncoder = async (codec: TranscoderCodec): Promise<EncoderProbeResult> => {
+    const cached = encoderProbeCache.get(codec);
+    if (cached) return cached;
+
+    const platform = os.platform();
+    const osSupported = (ENCODER_OS_SUPPORT[codec] || []).includes(platform);
+    if (!osSupported) {
+        const res: EncoderProbeResult = { id: codec, available: false, osSupported: false, reason: '현재 OS에서 지원하지 않음' };
+        encoderProbeCache.set(codec, res);
+        return res;
+    }
+
+    if (codec === 'libx264') {
+        const res: EncoderProbeResult = { id: codec, available: true, osSupported: true };
+        encoderProbeCache.set(codec, res);
+        return res;
+    }
+
+    const compiled = await getCompiledEncoders();
+    if (!compiled.has(codec)) {
+        const res: EncoderProbeResult = { id: codec, available: false, osSupported: true, reason: 'FFmpeg 빌드에 미포함' };
+        encoderProbeCache.set(codec, res);
+        return res;
+    }
+
+    const baseInput = ['-hide_banner', '-loglevel', 'error'];
+    const testSource = ['-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=0.1:r=10', '-frames:v', '1'];
+    const nullOut = ['-f', 'null', '-'];
+
+    let result: EncoderProbeResult;
+    if (codec === 'h264_vaapi') {
+        const devices = getLinuxRenderDevices();
+        if (devices.length === 0) {
+            result = { id: codec, available: false, osSupported: true, reason: '/dev/dri 렌더 장치를 찾을 수 없음' };
+        } else {
+            let lastError = 'VA-API 장치 초기화 실패';
+            let matchedDevice: string | undefined;
+            for (const dev of devices) {
+                const probe = await runFfmpegProbe([
+                    ...baseInput,
+                    '-hwaccel', 'vaapi', '-hwaccel_device', dev,
+                    ...testSource,
+                    '-vf', 'format=nv12,hwupload',
+                    '-c:v', 'h264_vaapi',
+                    ...nullOut,
+                ]);
+                if (probe.ok) {
+                    matchedDevice = dev;
+                    detectedRenderDevices.h264_vaapi = dev;
+                    break;
+                }
+                if (probe.error) lastError = probe.error;
+            }
+            result = matchedDevice
+                ? { id: codec, available: true, osSupported: true, device: matchedDevice }
+                : { id: codec, available: false, osSupported: true, reason: lastError };
+        }
+    } else if (codec === 'h264_qsv') {
+        if (platform === 'linux') {
+            const devices = getLinuxRenderDevices();
+            if (devices.length === 0) {
+                result = { id: codec, available: false, osSupported: true, reason: '/dev/dri 렌더 장치를 찾을 수 없음' };
+            } else {
+                let lastError = 'QSV 장치 초기화 실패';
+                let matchedDevice: string | undefined;
+                for (const dev of devices) {
+                    const probe = await runFfmpegProbe([
+                        ...baseInput,
+                        '-qsv_device', dev,
+                        ...testSource,
+                        '-c:v', 'h264_qsv', '-pix_fmt', 'nv12', '-preset', 'veryfast',
+                        ...nullOut,
+                    ]);
+                    if (probe.ok) {
+                        matchedDevice = dev;
+                        detectedRenderDevices.h264_qsv = dev;
+                        break;
+                    }
+                    if (probe.error) lastError = probe.error;
+                }
+                result = matchedDevice
+                    ? { id: codec, available: true, osSupported: true, device: matchedDevice }
+                    : { id: codec, available: false, osSupported: true, reason: lastError };
+            }
+        } else {
+            const probe = await runFfmpegProbe([
+                ...baseInput,
+                ...testSource,
+                '-c:v', 'h264_qsv', '-pix_fmt', 'nv12', '-preset', 'veryfast',
+                ...nullOut,
+            ]);
+            result = probe.ok
+                ? { id: codec, available: true, osSupported: true }
+                : { id: codec, available: false, osSupported: true, reason: probe.error || '하드웨어 미지원' };
+        }
+    } else if (codec === 'h264_nvenc') {
+        const probe = await runFfmpegProbe([
+            ...baseInput,
+            ...testSource,
+            '-c:v', 'h264_nvenc', '-pix_fmt', 'yuv420p', '-preset', 'p1',
+            ...nullOut,
+        ]);
+        result = probe.ok
+            ? { id: codec, available: true, osSupported: true }
+            : { id: codec, available: false, osSupported: true, reason: probe.error || 'NVIDIA GPU를 찾을 수 없음' };
+    } else if (codec === 'h264_amf') {
+        const probe = await runFfmpegProbe([
+            ...baseInput,
+            ...testSource,
+            '-c:v', 'h264_amf', '-pix_fmt', 'yuv420p', '-quality', 'speed',
+            ...nullOut,
+        ]);
+        result = probe.ok
+            ? { id: codec, available: true, osSupported: true }
+            : { id: codec, available: false, osSupported: true, reason: probe.error || 'AMD AMF 드라이버를 찾을 수 없음' };
+    } else {
+        result = { id: codec, available: false, osSupported: false, reason: '지원하지 않는 인코더' };
+    }
+
+    encoderProbeCache.set(codec, result);
+    return result;
+};
+
+const probeAllEncoders = async (): Promise<EncoderProbeResult[]> => {
+    if (probeAllInFlight) return probeAllInFlight;
+    probeAllInFlight = Promise.all(SUPPORTED_ENCODERS.map(codec => probeEncoder(codec)))
+        .finally(() => { probeAllInFlight = null; });
+    return probeAllInFlight;
+};
+
+const checkEncoder = async (codec: string): Promise<boolean> => {
+    if (codec === 'copy' || codec === 'libx264') return true;
+    if (!SUPPORTED_ENCODERS.includes(codec as TranscoderCodec)) return false;
+    const result = await probeEncoder(codec as TranscoderCodec);
+    return result.available;
 };
 
 const cleanupStream = (id: string, quality?: string, deleteFiles: boolean = true) => {
@@ -170,7 +379,7 @@ router.post('/config', async (req, res) => {
 
 // ⚡ 시스템 폴더 브라우징 API (설정 모달용)
 // ─── API: 시스템 하드웨어 및 트랜스코딩 설정 조회 ───
-router.get('/settings/transcoder', (req, res) => {
+router.get('/settings/transcoder', async (req, res) => {
     let gpuInfo = '알 수 없는 하드웨어';
     try {
         if (os.platform() === 'win32') {
@@ -210,13 +419,17 @@ router.get('/settings/transcoder', (req, res) => {
         if (row) codec = row.value;
     } catch (e) {}
 
-    res.json({ gpu: gpuInfo, codec });
+    const encoders = await probeAllEncoders();
+    res.json({ gpu: gpuInfo, codec, platform: os.platform(), encoders });
 });
 
 // ─── API: 트랜스코딩 설정 업데이트 ───
 router.put('/settings/transcoder', (req, res) => {
     const { codec } = req.body;
     if (!codec) return res.status(400).json({ error: '코덱 값이 없습니다.' });
+    if (!SUPPORTED_ENCODERS.includes(codec as TranscoderCodec)) {
+        return res.status(400).json({ error: '지원하지 않는 인코더 코덱입니다.' });
+    }
 
     try {
         db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?').run('transcoder_codec', codec, codec);
@@ -714,14 +927,15 @@ router.get('/hls/:id/:quality/:file', async (req, res) => {
                 vCodec = 'libx264';
             }
 
-            // 하드웨어 인코더(VCN)는 4K(4096x2160) 초과 해상도(예: 세로 3864px 등)에서 
+            // 대부분의 H.264 하드웨어 인코더(VAAPI/NVENC/QSV/AMF)는 4K(4096x2160) 초과 해상도에서
             // 극심한 병목이나 실패를 유발하므로 Emby와 동일하게 소프트웨어 처리로 강제 폴백
             const [origW, origH] = video.resolution ? video.resolution.split('x').map(Number) : [1920, 1080];
             const originalHeight = isNaN(origH) ? 1080 : origH;
             const originalWidth = isNaN(origW) ? 1920 : origW;
-            
-            if (vCodec === 'h264_vaapi' && (originalWidth > 4096 || originalHeight > 2160)) {
-                console.log(`⚠️ [ID: ${id}] 해상도(${video.resolution})가 하드웨어 인코딩 한계를 초과하여 libx264로 자동 하향합니다.`);
+
+            const isHardwareEncoder = vCodec !== 'libx264' && vCodec !== 'copy';
+            if (isHardwareEncoder && (originalWidth > 4096 || originalHeight > 2160)) {
+                console.log(`⚠️ [ID: ${id}] 해상도(${video.resolution})가 하드웨어 인코더(${vCodec}) 한계를 초과하여 libx264로 자동 하향합니다.`);
                 vCodec = 'libx264';
             }
 
@@ -730,119 +944,134 @@ router.get('/hls/:id/:quality/:file', async (req, res) => {
                 vCodec = 'copy';
                 aCodec = 'copy';
             }
-            
-            // 입력 옵션: 고속 탐색 (Input Seek) 및 멀티코어 디코딩 활성화
-            const inputOptions = ['-threads', '0'];
-            
-            // AV1 비디오인 경우 libdav1d 디코더 강제 사용 (손상된 헤더 무시 및 호환성 확보)
-            if (video.video_codec === 'av1' || video.video_codec === 'av01') {
-                inputOptions.push('-c:v', 'libdav1d');
-            }
 
-            if (vCodec === 'h264_vaapi') {
-                // -hwaccel_output_format vaapi를 제거하여 디코딩 실패 시(예: 10-bit H.264) 안전하게 소프트웨어 메모리로 폴백되도록 함
-                inputOptions.push('-hwaccel', 'vaapi', '-hwaccel_device', '/dev/dri/renderD128');
-            }
-            
-            // 시작 시간 지정 (0초일 때도 타임스탬프 영점화를 위해 항상 강제)
-            inputOptions.push('-ss', String(startTime));
+            const launchEncoder = (targetVCodec: string, allowFallback: boolean) => {
+                // 입력 옵션: 고속 탐색 (Input Seek) 및 멀티코어 디코딩 활성화
+                const inputOptions = ['-threads', '0'];
 
-            const outputOptions = [
-                '-threads', '0', // 멀티코어 인코딩 명시적 활성화
-                '-c:v', vCodec,
-                '-c:a', aCodec,
-                '-start_number', String(seq),
-                '-hls_time', String(SEGMENT_TIME),
-                '-hls_list_size', '0',
-                '-hls_flags', 'independent_segments+temp_file',
-                '-hls_segment_filename', path.join(outDir, 'stream%d.ts'),
-                '-f', 'hls'
-            ];
+                // AV1 비디오인 경우 libdav1d 디코더 강제 사용 (손상된 헤더 무시 및 호환성 확보)
+                if (video.video_codec === 'av1' || video.video_codec === 'av01') {
+                    inputOptions.push('-c:v', 'libdav1d');
+                }
 
-            if (vCodec !== 'copy' && vCodec !== 'h264_vaapi') {
-                outputOptions.push('-pix_fmt', 'yuv420p');
-            }
+                if (targetVCodec === 'h264_vaapi') {
+                    // -hwaccel_output_format vaapi를 제거하여 디코딩 실패 시(예: 10-bit H.264) 안전하게 소프트웨어 메모리로 폴백되도록 함
+                    const renderDevice = detectedRenderDevices.h264_vaapi || getLinuxRenderDevices()[0] || '/dev/dri/renderD128';
+                    inputOptions.push('-hwaccel', 'vaapi', '-hwaccel_device', renderDevice);
+                } else if (targetVCodec === 'h264_qsv' && os.platform() === 'linux') {
+                    const renderDevice = detectedRenderDevices.h264_qsv || getLinuxRenderDevices()[0] || '/dev/dri/renderD128';
+                    inputOptions.push('-qsv_device', renderDevice);
+                }
 
-            // PTS 시간 동기화 (재생 시간이 리셋되지 않고 startTime부터 시작되도록 강제)
-            outputOptions.push('-output_ts_offset', String(startTime));
+                // 시작 시간 지정 (0초일 때도 타임스탬프 영점화를 위해 항상 강제)
+                inputOptions.push('-ss', String(startTime));
 
-            if (vCodec === 'h264_vaapi') {
-                if (applyScaleFilter) {
-                    outputOptions.push('-vf', `format=nv12,hwupload,scale_vaapi=w=-2:h=${targetHeight}`);
+                const outputOptions = [
+                    '-threads', '0', // 멀티코어 인코딩 명시적 활성화
+                    '-c:v', targetVCodec,
+                    '-c:a', aCodec,
+                    '-start_number', String(seq),
+                    '-hls_time', String(SEGMENT_TIME),
+                    '-hls_list_size', '0',
+                    '-hls_flags', 'independent_segments+temp_file',
+                    '-hls_segment_filename', path.join(outDir, 'stream%d.ts'),
+                    '-f', 'hls'
+                ];
+
+                if (targetVCodec === 'h264_qsv') {
+                    outputOptions.push('-pix_fmt', 'nv12');
+                } else if (targetVCodec !== 'copy' && targetVCodec !== 'h264_vaapi') {
+                    outputOptions.push('-pix_fmt', 'yuv420p');
+                }
+
+                // PTS 시간 동기화 (재생 시간이 리셋되지 않고 startTime부터 시작되도록 강제)
+                outputOptions.push('-output_ts_offset', String(startTime));
+
+                if (targetVCodec === 'h264_vaapi') {
+                    if (applyScaleFilter) {
+                        outputOptions.push('-vf', `format=nv12,hwupload,scale_vaapi=w=-2:h=${targetHeight}`);
+                    } else {
+                        // 해상도 변경이 없을 때 픽셀 포맷 변환 및 하드웨어 업로드만 수행
+                        outputOptions.push('-vf', 'format=nv12,hwupload');
+                    }
                 } else {
-                    // 해상도 변경이 없을 때 픽셀 포맷 변환 및 하드웨어 업로드만 수행
-                    outputOptions.push('-vf', 'format=nv12,hwupload');
-                }
-            } else {
-                if (applyScaleFilter) {
-                    outputOptions.push('-vf', `scale=-2:${targetHeight}`);
-                }
-            }
-
-            if (targetBitrate && vCodec !== 'copy') {
-                outputOptions.push('-b:v', targetBitrate);
-                outputOptions.push('-maxrate', targetBitrate);
-                const bitVal = parseInt(targetBitrate.replace('M', ''));
-                if (!isNaN(bitVal)) {
-                    outputOptions.push('-bufsize', `${bitVal * 2}M`);
-                }
-            }
-
-            if (vCodec === 'libx264') {
-                outputOptions.push('-preset', 'ultrafast');
-            } else if (vCodec === 'h264_nvenc') {
-                outputOptions.push('-preset', 'p1');
-            } else if (vCodec === 'h264_qsv') {
-                outputOptions.push('-preset', 'veryfast');
-            } else if (vCodec === 'h264_amf') {
-                outputOptions.push('-quality', 'speed');
-            }
-
-            if (vCodec !== 'copy') {
-                outputOptions.push('-g', '60');
-                outputOptions.push('-sc_threshold', '0');
-                // HLS 탐색 시 깨짐 방지를 위해 반드시 Closed GOP 사용
-                outputOptions.push('-flags', '+cgop');
-                // iOS Safari 프리징 방지: 세그먼트 경계(3초)마다 강제로 키프레임(IDR) 삽입 (startTime 보정 포함)
-                outputOptions.push('-force_key_frames', `expr:gte(t,${startTime}+n_forced*${SEGMENT_TIME})`);
-                
-                if (vCodec === 'libx264') {
-                    outputOptions.push('-profile:v', 'high');
-                }
-            }
-
-            const command = ffmpeg(video.file_path)
-                .inputOptions(inputOptions)
-                .outputOptions(outputOptions)
-                .output(path.join(outDir, 'dummy.m3u8'))
-                .on('start', (cmd) => console.log(`✅ [${quality}] 실행 명령어:`, cmd))
-                .on('stderr', (stderr) => {
-                    const lowerStderr = stderr.toLowerCase();
-                    if (lowerStderr.includes('error') && !lowerStderr.includes('configuration:') && !lowerStderr.includes('hwaccel initialisation returned error')) {
-                        console.error(`❌ [${quality}] FFmpeg 에러:`, stderr);
+                    if (applyScaleFilter) {
+                        outputOptions.push('-vf', `scale=-2:${targetHeight}`);
                     }
-                })
-                .on('error', (err) => {
-                    if (!err.message.includes('SIGKILL')) {
-                        console.error(`❌ [${quality}] 인코딩 실패:`, err.message);
-                    }
-                    // SIGKILL은 비동기로 뒤늦게 도착할 수 있으므로, 그 사이 다른 요청이 이미
-                    // 새 인코더로 교체했다면(activeStreams[streamKey].command !== command) 절대 건드리지 않음.
-                    // 그렇지 않으면 방금 죽은(과거) 프로세스의 뒤늦은 에러 이벤트가 현재 정상 실행 중인
-                    // 인코더의 참조를 잘못 삭제해 불필요한 추가 재실행을 유발함.
-                    if (activeStreams[streamKey]?.command === command) {
-                        delete activeStreams[streamKey].command;
-                    }
-                })
-                .on('end', () => {
-                    console.log(`✅ [ID: ${id}] ${quality} 전체 인코딩 완료`);
-                });
+                }
 
-            activeStreams[streamKey].command = command;
-            activeStreams[streamKey].currentSeq = seq;
-            activeStreams[streamKey].startTime = Date.now();
-            activeStreams[streamKey].launching = false;
-            command.run();
+                if (targetBitrate && targetVCodec !== 'copy') {
+                    outputOptions.push('-b:v', targetBitrate);
+                    outputOptions.push('-maxrate', targetBitrate);
+                    const bitVal = parseInt(targetBitrate.replace('M', ''));
+                    if (!isNaN(bitVal)) {
+                        outputOptions.push('-bufsize', `${bitVal * 2}M`);
+                    }
+                }
+
+                if (targetVCodec === 'libx264') {
+                    outputOptions.push('-preset', 'ultrafast');
+                } else if (targetVCodec === 'h264_nvenc') {
+                    outputOptions.push('-preset', 'p1');
+                } else if (targetVCodec === 'h264_qsv') {
+                    outputOptions.push('-preset', 'veryfast');
+                } else if (targetVCodec === 'h264_amf') {
+                    outputOptions.push('-quality', 'speed');
+                }
+
+                if (targetVCodec !== 'copy') {
+                    outputOptions.push('-g', '60');
+                    outputOptions.push('-sc_threshold', '0');
+                    // HLS 탐색 시 깨짐 방지를 위해 반드시 Closed GOP 사용
+                    outputOptions.push('-flags', '+cgop');
+                    // iOS Safari 프리징 방지: 세그먼트 경계(3초)마다 강제로 키프레임(IDR) 삽입 (startTime 보정 포함)
+                    outputOptions.push('-force_key_frames', `expr:gte(t,${startTime}+n_forced*${SEGMENT_TIME})`);
+
+                    if (targetVCodec === 'libx264') {
+                        outputOptions.push('-profile:v', 'high');
+                    }
+                }
+
+                const command = ffmpeg(video.file_path)
+                    .inputOptions(inputOptions)
+                    .outputOptions(outputOptions)
+                    .output(path.join(outDir, 'dummy.m3u8'))
+                    .on('start', (cmd) => console.log(`✅ [${quality}] 실행 명령어:`, cmd))
+                    .on('stderr', (stderr) => {
+                        const lowerStderr = stderr.toLowerCase();
+                        if (lowerStderr.includes('error') && !lowerStderr.includes('configuration:') && !lowerStderr.includes('hwaccel initialisation returned error')) {
+                            console.error(`❌ [${quality}] FFmpeg 에러:`, stderr);
+                        }
+                    })
+                    .on('error', (err) => {
+                        const isKilled = err.message.includes('SIGKILL');
+                        if (!isKilled) {
+                            console.error(`❌ [${quality}] 인코딩 실패 (${targetVCodec}):`, err.message);
+                        }
+                        // SIGKILL은 비동기로 뒤늦게 도착할 수 있으므로, 그 사이 다른 요청이 이미
+                        // 새 인코더로 교체했다면(activeStreams[streamKey].command !== command) 절대 건드리지 않음.
+                        // 그렇지 않으면 방금 죽은(과거) 프로세스의 뒤늦은 에러 이벤트가 현재 정상 실행 중인
+                        // 인코더의 참조를 잘못 삭제해 불필요한 추가 재실행을 유발함.
+                        if (activeStreams[streamKey]?.command === command) {
+                            delete activeStreams[streamKey].command;
+                            if (!isKilled && allowFallback && targetVCodec !== 'libx264' && targetVCodec !== 'copy' && !fs.existsSync(filePath)) {
+                                console.warn(`⚠️ [ID: ${id}] 하드웨어 인코더(${targetVCodec}) 런타임 실패로 libx264로 자동 폴백합니다.`);
+                                launchEncoder('libx264', false);
+                            }
+                        }
+                    })
+                    .on('end', () => {
+                        console.log(`✅ [ID: ${id}] ${quality} 전체 인코딩 완료`);
+                    });
+
+                activeStreams[streamKey].command = command;
+                activeStreams[streamKey].currentSeq = seq;
+                activeStreams[streamKey].startTime = Date.now();
+                activeStreams[streamKey].launching = false;
+                command.run();
+            };
+
+            launchEncoder(vCodec, true);
         }
     }
 

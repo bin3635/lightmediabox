@@ -1372,18 +1372,62 @@ async function loadTranscoderSettings() {
             else gpuInfo.innerText = '조회 중...';
         }
         const res = await fetch('/api/settings/transcoder');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        
+
         if (gpuInfo) {
             if (gpuInfo.tagName === 'INPUT') gpuInfo.value = data.gpu || '알 수 없는 하드웨어';
             else gpuInfo.innerText = data.gpu || '알 수 없는 하드웨어';
         }
-        
+
+        const encoderMap = new Map();
+        if (Array.isArray(data.encoders)) {
+            for (const enc of data.encoders) {
+                encoderMap.set(enc.id, enc);
+            }
+        }
+
         const radios = document.getElementsByName('transcoder_codec');
+        let selectedApplied = false;
         for (let r of radios) {
-            if (r.value === data.codec) {
+            const info = encoderMap.get(r.value);
+            const label = r.closest('.transcoder-option');
+            const badge = label ? label.querySelector('.encoder-status-badge') : null;
+
+            if (info) {
+                const isUsable = Boolean(info.available) || r.value === 'libx264';
+                r.disabled = !isUsable;
+                if (label) {
+                    label.classList.toggle('disabled', !isUsable);
+                    label.title = !isUsable && info.reason ? info.reason : (info.device ? `장치: ${info.device}` : '');
+                }
+                if (badge) {
+                    if (isUsable) {
+                        badge.className = 'encoder-status-badge badge-available';
+                        badge.innerText = '사용 가능';
+                    } else if (!info.osSupported) {
+                        badge.className = 'encoder-status-badge badge-unsupported';
+                        badge.innerText = '미지원 OS';
+                    } else {
+                        badge.className = 'encoder-status-badge badge-unavailable';
+                        badge.innerText = '사용 불가';
+                    }
+                }
+            }
+
+            if (r.value === data.codec && !r.disabled) {
                 r.checked = true;
-                break;
+                selectedApplied = true;
+            }
+        }
+
+        // 저장된 코덱이 현재 환경에서 사용 불가능하면 기본 CPU(libx264)로 안전 폴백 표시
+        if (!selectedApplied) {
+            for (let r of radios) {
+                if (r.value === 'libx264') {
+                    r.checked = true;
+                    break;
+                }
             }
         }
     } catch (err) {
@@ -1554,6 +1598,7 @@ function startFfmpegPolling() {
                     showToast(state.error || 'FFmpeg 업데이트 중 오류가 발생했습니다.', 'error');
                 }
                 loadFfmpegSettings();
+                loadTranscoderSettings();
                 return;
             }
         } catch (err) {

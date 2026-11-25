@@ -50,6 +50,12 @@ let updateState: FfmpegUpdateState = {
     message: '대기 중'
 };
 
+const ffmpegUpdateListeners: (() => void)[] = [];
+
+export const onFfmpegUpdated = (listener: () => void) => {
+    ffmpegUpdateListeners.push(listener);
+};
+
 export const getUpdateState = (): FfmpegUpdateState => {
     return { ...updateState };
 };
@@ -526,8 +532,11 @@ export const updateFfmpeg = async (): Promise<{ success: boolean; message: strin
         if (fs.existsSync(extractTempPath)) fs.rmSync(extractTempPath, { recursive: true, force: true });
         if (fs.existsSync(archivePath)) fs.unlinkSync(archivePath);
 
-        // 캐시 무효화
+        // 캐시 무효화 및 리스너 알림 (인코더 프로브 캐시 초기화 등)
         latestCache = null;
+        for (const listener of ffmpegUpdateListeners) {
+            try { listener(); } catch (e) { }
+        }
 
         updateState = {
             isUpdating: false,

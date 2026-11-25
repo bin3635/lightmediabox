@@ -21,7 +21,7 @@
         };
     </script>
     <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
-    <link rel="stylesheet" href="styles.css?v=9">
+    <link rel="stylesheet" href="styles.css?v=10">
 </head>
 
 <body>
@@ -259,26 +259,31 @@
                     
                     <div class="form-group" style="margin-top: 24px;">
                         <label>사용할 인코더 선택</label>
-                        <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 8px;">
-                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: #fff; font-size: 14px; font-weight: normal;">
+                        <div id="transcoder-encoder-list" style="display: flex; flex-direction: column; gap: 10px; margin-top: 8px;">
+                            <label class="transcoder-option">
                                 <input type="radio" name="transcoder_codec" value="libx264" checked>
-                                <span>[기본] 범용 CPU (libx264)</span>
+                                <span class="transcoder-option-label">[기본] 범용 CPU (libx264)</span>
+                                <span class="encoder-status-badge badge-checking">확인 중</span>
                             </label>
-                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: #fff; font-size: 14px; font-weight: normal;">
+                            <label class="transcoder-option">
                                 <input type="radio" name="transcoder_codec" value="h264_nvenc">
-                                <span>[NVIDIA] 외장 그래픽 (h264_nvenc)</span>
+                                <span class="transcoder-option-label">[NVIDIA] 외장 그래픽 (h264_nvenc)</span>
+                                <span class="encoder-status-badge badge-checking">확인 중</span>
                             </label>
-                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: #fff; font-size: 14px; font-weight: normal;">
+                            <label class="transcoder-option">
                                 <input type="radio" name="transcoder_codec" value="h264_amf">
-                                <span>[AMD] Radeon 그래픽 (h264_amf)</span>
+                                <span class="transcoder-option-label">[AMD] Radeon 그래픽 (h264_amf)</span>
+                                <span class="encoder-status-badge badge-checking">확인 중</span>
                             </label>
-                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: #fff; font-size: 14px; font-weight: normal;">
+                            <label class="transcoder-option">
                                 <input type="radio" name="transcoder_codec" value="h264_vaapi">
-                                <span>[Linux 범용] VA-API 하드웨어 가속 (h264_vaapi)</span>
+                                <span class="transcoder-option-label">[Linux 범용] VA-API 하드웨어 가속 (h264_vaapi)</span>
+                                <span class="encoder-status-badge badge-checking">확인 중</span>
                             </label>
-                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; color: #fff; font-size: 14px; font-weight: normal;">
+                            <label class="transcoder-option">
                                 <input type="radio" name="transcoder_codec" value="h264_qsv">
-                                <span>[Intel] 내장 그래픽 (h264_qsv)</span>
+                                <span class="transcoder-option-label">[Intel] Quick Sync 내장 그래픽 (h264_qsv)</span>
+                                <span class="encoder-status-badge badge-checking">확인 중</span>
                             </label>
                         </div>
                     </div>
