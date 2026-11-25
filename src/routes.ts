@@ -260,80 +260,117 @@ const checkEncoder = async (codec: string): Promise<boolean> => {
     return result.available;
 };
 
-const cleanupStream = (id: string, quality?: string, deleteFiles: boolean = true) => {
-    if (quality) {
-        // 특정 화질 정리
-        const key = getStreamKey(id, quality);
+const parseResolution = (resolution: string | null) => {
+    const [w, h] = resolution ? resolution.split('x').map(Number) : [1920, 1080];
+    return { width: isNaN(w) ? 1920 : w, height: isNaN(h) ? 1080 : h };
+};
+
+const parseQualitySpec = (quality: string, originalHeight: number) => {
+    const needsScale = quality !== 'original';
+    let targetHeight = 0;
+    let targetBitrate = '';
+    let applyScaleFilter = needsScale;
+    if (needsScale) {
+        if (quality.includes('_')) {
+            const [resPart, bitratePart] = quality.split('_');
+            targetHeight = parseInt(resPart.replace('p', ''), 10);
+            targetBitrate = bitratePart;
+        } else {
+            targetHeight = parseInt(quality.replace('p', ''), 10);
+        }
+        if (targetHeight === originalHeight) applyScaleFilter = false;
+    }
+    return { needsScale, targetHeight, targetBitrate, applyScaleFilter };
+};
+
+const getDirectPlayContentType = (filePath: string): string => {
+    const ext = path.extname(filePath).toLowerCase();
+    if (ext === '.webm') return 'video/webm';
+    if (ext === '.mov') return 'video/quicktime';
+    return 'video/mp4';
+};
+
+const getLatestGeneratedSeq = (outDir: string, fallbackSeq: number): number => {
+    const dummyM3u8Path = path.join(outDir, 'dummy.m3u8');
+    if (!fs.existsSync(dummyM3u8Path)) return fallbackSeq;
+    try {
+        const content = fs.readFileSync(dummyM3u8Path, 'utf8');
+        const matches = [...content.matchAll(/stream(\d+)\.ts/g)];
+        if (matches.length > 0) return parseInt(matches[matches.length - 1][1], 10);
+    } catch (e) {}
+    return fallbackSeq;
+};
+
+const cleanupStream = (id: string, quality?: string, deleteFiles: boolean = true): boolean => {
+    let stoppedAny = false;
+    const targetKeys = quality
+        ? [getStreamKey(id, quality)]
+        : Object.keys(activeStreams).filter(key => key.startsWith(`${id}_`));
+
+    for (const key of targetKeys) {
         const stream = activeStreams[key];
-        if (stream) {
-            if (stream.command) {
-                stream.command.kill('SIGKILL');
-                delete stream.command;
-            }
-            if (deleteFiles) {
-                clearTimeout(stream.timeout);
-                delete activeStreams[key];
-            }
+        if (!stream) continue;
+        if (stream.command) {
+            if (!quality) console.log(`🛑 [ID: ${id}] 자원 확보를 위해 기존 인코더 프로세스 강제 종료: ${key}`);
+            stream.command.kill('SIGKILL');
+            delete stream.command;
+            stoppedAny = true;
         }
+        stream.launching = false;
         if (deleteFiles) {
-            const outDir = path.join(HLS_TEMP_DIR, id.toString(), quality);
-            if (fs.existsSync(outDir)) {
-                fs.rmSync(outDir, { recursive: true, force: true });
-                console.log(`🧹 [ID: ${id}] ${quality} 임시 HLS 파일 정리 완료`);
-            }
-        }
-    } else {
-        // 해당 비디오의 모든 화질 정리
-        for (const key of Object.keys(activeStreams)) {
-            if (key.startsWith(`${id}_`)) {
-                const stream = activeStreams[key];
-                if (stream.command) {
-                    console.log(`🛑 [ID: ${id}] 자원 확보를 위해 기존 인코더 프로세스 강제 종료: ${key}`);
-                    stream.command.kill('SIGKILL');
-                    delete stream.command;
-                }
-                if (deleteFiles) {
-                    clearTimeout(stream.timeout);
-                    delete activeStreams[key];
-                }
-            }
-        }
-        if (deleteFiles) {
-            const outDir = path.join(HLS_TEMP_DIR, id.toString());
-            if (fs.existsSync(outDir)) {
-                fs.rmSync(outDir, { recursive: true, force: true });
-                console.log(`🧹 [ID: ${id}] 임시 HLS 파일 전체 정리 완료`);
-            }
+            clearTimeout(stream.timeout);
+            delete activeStreams[key];
         }
     }
+
+    if (deleteFiles) {
+        const outDir = quality
+            ? path.join(HLS_TEMP_DIR, id.toString(), quality)
+            : path.join(HLS_TEMP_DIR, id.toString());
+        fs.promises.rm(outDir, { recursive: true, force: true })
+            .then(() => console.log(`🧹 [ID: ${id}] ${quality ? `${quality} 임시 HLS 파일` : `임시 HLS 파일 전체`} 정리 완료`))
+            .catch(() => {});
+    }
+    return stoppedAny;
+};
+
+const touchStreamTimeout = (id: string, quality: string) => {
+    const streamKey = getStreamKey(id, quality);
+    if (!activeStreams[streamKey]) activeStreams[streamKey] = {};
+    if (activeStreams[streamKey].timeout) clearTimeout(activeStreams[streamKey].timeout);
+    activeStreams[streamKey].timeout = setTimeout(() => cleanupStream(id, quality), SESSION_TIMEOUT_MS);
+};
+
+const isSequentialSegmentRequest = (streamKey: string, seq: number, outDir: string): boolean => {
+    const stream = activeStreams[streamKey];
+    if (!stream?.command || stream.currentSeq === undefined) return true;
+    const currentSeq = stream.currentSeq;
+    const timeSinceStart = Date.now() - (stream.startTime || 0);
+
+    // FFmpeg가 방금(3초 이내) 시작되었다면 동시에 들어온 Safari의 다중 요청일 가능성이 높으므로 킬하지 않음
+    if (timeSinceStart < 3000 && seq >= currentSeq && seq <= currentSeq + 5) return true;
+    if (seq < currentSeq) {
+        // Edge/iOS Safari 네이티브 HLS 엔진이 화질 변경 직후 이전 시점을 한 번 더 요청하는 현상 보호
+        return Boolean(stream.coldStart && timeSinceStart < 1500);
+    }
+    const latestSeq = getLatestGeneratedSeq(outDir, currentSeq);
+    return seq <= latestSeq + 3;
 };
 
 // 원본 해상도를 분석하여 제공할 화질 목록을 계산하는 헬퍼 함수
 const getAvailableQualities = (resolution: string | null) => {
-    const [w, h] = resolution ? resolution.split('x').map(Number) : [1920, 1080];
-    const originalHeight = isNaN(h) ? 1080 : h;
-    const originalWidth = isNaN(w) ? 1920 : w;
-
+    const { width: originalWidth, height: originalHeight } = parseResolution(resolution);
     const qualities = [{ name: 'original', label: `원본 (${originalHeight}p)`, height: originalHeight, width: originalWidth }];
-    
     if (originalHeight >= 2160) {
         qualities.push({ name: '2160p_80M', label: '4K - 80 Mbps', height: 2160, width: 0 });
         qualities.push({ name: '2160p_40M', label: '4K - 40 Mbps', height: 2160, width: 0 });
     }
-    
     if (originalHeight >= 1080) {
         qualities.push({ name: '1080p_20M', label: '1080p - 20 Mbps', height: 1080, width: 0 });
         qualities.push({ name: '1080p_10M', label: '1080p - 10 Mbps', height: 1080, width: 0 });
     }
-    
-    if (originalHeight >= 720) {
-        qualities.push({ name: '720p_4M', label: '720p - 4 Mbps', height: 720, width: 0 });
-    }
-    
-    if (originalHeight >= 480) {
-        qualities.push({ name: '480p_1.5M', label: '480p - 1.5 Mbps', height: 480, width: 0 });
-    }
-
+    if (originalHeight >= 720) qualities.push({ name: '720p_4M', label: '720p - 4 Mbps', height: 720, width: 0 });
+    if (originalHeight >= 480) qualities.push({ name: '480p_1.5M', label: '480p - 1.5 Mbps', height: 480, width: 0 });
     return qualities;
 };
 
@@ -687,12 +724,10 @@ router.get('/hls/:id/qualities', (req, res) => {
     if (!video) return res.status(404).json({ error: '비디오를 찾을 수 없습니다.' });
 
     const qualities = getAvailableQualities(video.resolution);
-    
-    // MP4/WebM 컨테이너에 H.264/AAC 코덱인 경우 Direct Play (TS 변환 없는 원본 스트리밍) 지원 여부 판별
-    // ffprobe는 컨테이너 포맷을 'mov,mp4,m4a,3gp,3g2,mj2' 형식으로 반환하므로 includes를 사용합니다.
-    const isDirectPlaySupported = 
-        ((video.container_format.includes('mp4') || video.container_format.includes('mov')) && video.video_codec === 'h264' && video.audio_codec === 'aac') ||
-        (video.container_format.includes('webm') && (video.video_codec === 'vp8' || video.video_codec === 'vp9' || video.video_codec === 'av1'));
+    const container = video.container_format || '';
+    const isDirectPlaySupported =
+        ((container.includes('mp4') || container.includes('mov')) && video.video_codec === 'h264' && video.audio_codec === 'aac') ||
+        (container.includes('webm') && (video.video_codec === 'vp8' || video.video_codec === 'vp9' || video.video_codec === 'av1'));
 
     res.json({ qualities, isDirectPlaySupported });
 });
@@ -703,43 +738,61 @@ router.get('/video/:id/direct', (req, res) => {
     const video: any = db.prepare('SELECT * FROM videos WHERE id = ?').get(id);
     if (!video || !fs.existsSync(video.file_path)) return res.status(404).send('비디오를 찾을 수 없습니다.');
 
-    // Direct Play 전환 시 백그라운드에서 실행 중이던 이전 화질의 인코딩 프로세스를 즉각 종료 (자원 확보)
-    console.log(`⚡ Direct Play (원본) 스트리밍 시작: 비디오 ID ${id}`);
-    cleanupStream(id, undefined, false);
-
-    const stat = fs.statSync(video.file_path);
-    const fileSize = stat.size;
+    const stoppedHls = cleanupStream(id, undefined, false);
+    const fileSize = fs.statSync(video.file_path).size;
+    const contentType = getDirectPlayContentType(video.file_path);
     const range = req.headers.range;
 
+    let start = 0;
+    let end = fileSize - 1;
+    let statusCode = 200;
+
     if (range) {
-        const parts = range.replace(/bytes=/, "").split("-");
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-        const chunksize = (end - start) + 1;
-        const file = fs.createReadStream(video.file_path, { start, end });
-        const head = {
-            'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunksize,
-            'Content-Type': 'video/mp4',
-        };
-        res.writeHead(206, head);
-        file.pipe(res);
-    } else {
-        const head = {
-            'Content-Length': fileSize,
-            'Content-Type': 'video/mp4',
-        };
-        res.writeHead(200, head);
-        fs.createReadStream(video.file_path).pipe(res);
+        const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+        if (!match) {
+            res.setHeader('Content-Range', `bytes */${fileSize}`);
+            return res.sendStatus(416);
+        }
+        start = match[1] ? parseInt(match[1], 10) : 0;
+        end = match[2] ? Math.min(parseInt(match[2], 10), fileSize - 1) : fileSize - 1;
+        if (isNaN(start) || isNaN(end) || start < 0 || start >= fileSize || start > end) {
+            res.setHeader('Content-Range', `bytes */${fileSize}`);
+            return res.sendStatus(416);
+        }
+        statusCode = 206;
     }
+
+    if (stoppedHls || start === 0) {
+        console.log(`⚡ Direct Play (원본) 스트리밍 시작: 비디오 ID ${id}`);
+    }
+
+    const headers: Record<string, string | number> = {
+        'Accept-Ranges': 'bytes',
+        'Content-Length': (end - start) + 1,
+        'Content-Type': contentType,
+    };
+    if (statusCode === 206) headers['Content-Range'] = `bytes ${start}-${end}/${fileSize}`;
+
+    res.writeHead(statusCode, headers);
+    const fileStream = statusCode === 206
+        ? fs.createReadStream(video.file_path, { start, end })
+        : fs.createReadStream(video.file_path);
+
+    res.on('close', () => { if (!fileStream.destroyed) fileStream.destroy(); });
+    fileStream.on('error', (err) => {
+        console.error('Direct Play 스트림 읽기 오류:', err.message);
+        if (!res.headersSent) res.sendStatus(500);
+        else res.end();
+    });
+    fileStream.pipe(res);
 });
 
 // 스트리밍 명시적 종료 API (비디오 플레이어를 닫을 때 호출)
 router.post('/hls/:id/stop', (req, res) => {
     const { id } = req.params;
-    console.log(`[종료 요청] 비디오 ID: ${id} 인코딩 중지 (임시 폴더는 유지)`);
-    cleanupStream(id, undefined, false);
+    if (cleanupStream(id, undefined, false)) {
+        console.log(`[종료 요청] 비디오 ID: ${id} 인코딩 중지 (임시 폴더는 유지)`);
+    }
     res.sendStatus(200);
 });
 
@@ -749,35 +802,23 @@ router.get('/hls/:id/:quality/index.m3u8', (req, res) => {
     const video: any = db.prepare('SELECT * FROM videos WHERE id = ?').get(id);
     if (!video || !video.duration) return res.status(404).send('비디오를 찾을 수 없습니다.');
 
-    // 화질별 독립된 임시 폴더 생성
     const outDir = path.join(HLS_TEMP_DIR, id.toString(), quality);
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
 
-    // 타임아웃 갱신
     const streamKey = getStreamKey(id, quality);
-    
-    // 사용자가 화질을 변경했을 때, 동일한 비디오에 대해 백그라운드에서 돌아가고 있는 다른 화질의 인코딩 프로세스를 즉각 종료 (폴더는 유지)
     for (const key of Object.keys(activeStreams)) {
-        if (key.startsWith(`${id}_`) && key !== streamKey) {
+        if (key.startsWith(`${id}_`) && key !== streamKey && activeStreams[key]?.command) {
             console.log(`[화질 변경 감지] 자원 확보를 위해 기존 인코딩 강제 종료: ${key}`);
-            const oldQuality = key.substring(id.toString().length + 1);
-            cleanupStream(id, oldQuality, false);
+            cleanupStream(id, key.substring(id.toString().length + 1), false);
         }
     }
 
-    if (!activeStreams[streamKey]) activeStreams[streamKey] = {};
-    if (activeStreams[streamKey].timeout) clearTimeout(activeStreams[streamKey].timeout);
-    activeStreams[streamKey].timeout = setTimeout(() => cleanupStream(id, quality), SESSION_TIMEOUT_MS);
+    touchStreamTimeout(id, quality);
 
     const totalSegments = Math.ceil(video.duration / SEGMENT_TIME);
     let m3u8 = "#EXTM3U\n#EXT-X-VERSION:3\n";
     m3u8 += `#EXT-X-TARGETDURATION:${SEGMENT_TIME}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
 
-    // 재생 중 화질을 변경한 경우, 클라이언트가 currentTime을 스스로 정정하기 전에
-    // 브라우저(특히 네이티브 HLS 재생기)가 기본값인 0초 세그먼트부터 먼저 요청해버려
-    // 서버가 seq=0으로 인코딩을 시작했다가 곧바로 재생 위치로 재시작하는 낭비가 있었음.
-    // #EXT-X-START:TIME-OFFSET을 명시하면 hls.js/네이티브 플레이어 모두 처음부터
-    // 해당 위치의 세그먼트를 요청하므로 이 낭비가 원천적으로 사라진다.
     const startTimeParam = parseFloat((req.query.startTime as string) || '');
     if (!isNaN(startTimeParam) && startTimeParam > 0 && startTimeParam < video.duration) {
         m3u8 += `#EXT-X-START:TIME-OFFSET=${startTimeParam.toFixed(3)}\n`;
@@ -802,7 +843,7 @@ router.get('/hls/:id/:quality/:file', async (req, res) => {
     const video = db.prepare('SELECT * FROM videos WHERE id = ?').get(id) as VideoRecord | undefined;
     if (!video) return res.status(404).send('비디오를 찾을 수 없습니다.');
 
-    const seqMatch = file.match(/stream(\d+)\.ts/);
+    const seqMatch = file.match(/^stream(\d+)\.ts$/);
     if (!seqMatch) return res.status(400).send('잘못된 요청입니다.');
     const seq = parseInt(seqMatch[1], 10);
 
@@ -811,329 +852,186 @@ router.get('/hls/:id/:quality/:file', async (req, res) => {
     const filePath = path.join(outDir, file);
 
     const streamKey = getStreamKey(id, quality);
-
-    // 타임아웃 갱신
-    if (activeStreams[streamKey]?.timeout) {
-        clearTimeout(activeStreams[streamKey].timeout);
-        activeStreams[streamKey].timeout = setTimeout(() => cleanupStream(id, quality), SESSION_TIMEOUT_MS);
-    }
-
-    // 탐색(스킵) 감지 및 레이스 컨디션 방지
-    let isSequential = true;
-    if (activeStreams[streamKey]?.command && activeStreams[streamKey].currentSeq !== undefined) {
-        const currentSeq = activeStreams[streamKey].currentSeq;
-        
-        // FFmpeg가 방금(3초 이내) 시작되었다면, 동시에 들어온 Safari의 다중 요청일 가능성이 높으므로 킬하지 않음
-        const timeSinceStart = Date.now() - (activeStreams[streamKey].startTime || 0);
-        if (timeSinceStart < 3000 && seq >= currentSeq && seq <= currentSeq + 5) {
-            isSequential = true;
-        } else if (seq < currentSeq) {
-            // 현재 실행 중인 FFmpeg 시작점보다 과거 조각을 요청 (뒤로 탐색)
-            // 단, 스트림을 방금 막 새로 시작한(coldStart) 직후 아주 짧은 유예 시간 내라면
-            // 예외적으로 무시한다. Edge/iOS Safari 네이티브 HLS 엔진이 화질 변경 시 정확한
-            // 목표 위치로 먼저 정상 요청한 뒤, 곧바로 훨씬 이전 시점을 스스로 한 번 더
-            // 요청하는 현상이 관찰됨 — 이걸 즉시 재시작으로 처리하면 방금 정확히 시작된
-            // 인코더를 죽이고 엉뚱한 지점부터 다시 인코딩하게 되어 오히려 버퍼링을 유발함.
-            // 이미 한동안 돌고 있던 스트림에 대한 일반적인 되감기 탐색에는 영향 없음
-            // (coldStart는 최초 실행 시에만 true이고, 이후 재시작부터는 false로 꺼짐).
-            const coldStartGraceMs = 1500;
-            if (activeStreams[streamKey].coldStart && timeSinceStart < coldStartGraceMs) {
-                isSequential = true;
-            } else {
-                isSequential = false;
-            }
-        } else {
-            // 현재 FFmpeg가 어디까지 생성했는지 확인
-            let latestSeq = currentSeq;
-            const dummyM3u8Path = path.join(outDir, 'dummy.m3u8');
-            if (fs.existsSync(dummyM3u8Path)) {
-                try {
-                    const content = fs.readFileSync(dummyM3u8Path, 'utf8');
-                    const matches = [...content.matchAll(/stream(\d+)\.ts/g)];
-                    if (matches.length > 0) {
-                        latestSeq = parseInt(matches[matches.length - 1][1], 10);
-                    }
-                } catch(e) {}
-            }
-            
-            // HLS.js나 Safari가 미리 버퍼링하는 양은 보통 1~3개
-            if (seq > latestSeq + 3) {
-                isSequential = false; // 앞으로 탐색
-            }
-        }
-    }
+    touchStreamTimeout(id, quality);
 
     if (!fs.existsSync(filePath)) {
-        // 순차적이지 않으면 (즉 스킵/탐색의 경우) 기존 인코더 종료
+        const isSequential = isSequentialSegmentRequest(streamKey, seq, outDir);
+
         if (!isSequential && activeStreams[streamKey]?.command) {
             console.log(`🚀 탐색 감지됨: 기존 인코더 종료 및 seq=${seq} 부터 재시작`);
             activeStreams[streamKey].command.kill('SIGKILL');
             delete activeStreams[streamKey].command;
             activeStreams[streamKey].launching = false;
-            activeStreams[streamKey].coldStart = false; // 한 번이라도 재시작을 거치면 더 이상 "막 시작한" 상태가 아님
+            activeStreams[streamKey].coldStart = false;
 
-            // 이전 상태가 담긴 dummy.m3u8 삭제 (동시 요청 레이스 컨디션 방지)
             const dummyM3u8Path = path.join(outDir, 'dummy.m3u8');
             if (fs.existsSync(dummyM3u8Path)) {
-                try { fs.unlinkSync(dummyM3u8Path); } catch(e) {}
+                try { fs.unlinkSync(dummyM3u8Path); } catch (e) {}
             }
         }
 
-        // 인코딩 시작 (launching 플래그로 await 중 동시 진입 방지)
         if (!activeStreams[streamKey]?.command && !activeStreams[streamKey]?.launching) {
-            if (!activeStreams[streamKey]) activeStreams[streamKey] = {};
-            // 이 streamKey에 대해 한 번도 인코더가 실행된 적이 없는 진짜 최초 실행일 때만
-            // coldStart를 켠다 (위쪽 탐색 감지 로직의 유예 시간 보호 대상 판별용).
             activeStreams[streamKey].coldStart = activeStreams[streamKey].currentSeq === undefined;
             activeStreams[streamKey].launching = true;
 
-            const startTime = seq * SEGMENT_TIME;
-            console.log(`🎬 [ID: ${id}] ${quality} 화질 인코딩 시작 (seq=${seq}, time=${startTime}s)`);
-
-            const needsScale = quality !== 'original';
-            
-            let targetHeight = 0;
-            let targetBitrate = '';
-            let applyScaleFilter = needsScale;
-            
-            if (quality !== 'original') {
-                if (quality.includes('_')) {
-                    const parts = quality.split('_');
-                    targetHeight = parseInt(parts[0].replace('p', ''), 10);
-                    targetBitrate = parts[1];
-                } else {
-                    targetHeight = parseInt(quality.replace('p', ''), 10);
-                }
-                
-                // 불필요한 스케일링 방지 (원본 세로 해상도와 목표 해상도가 같을 때)
-                if (video.resolution) {
-                    const [origW, origH] = video.resolution.split('x').map(Number);
-                    if (targetHeight === origH) {
-                        applyScaleFilter = false;
-                    }
-                }
-            }
-
-            // A/V 싱크를 위해 둘 다 copy 하거나 둘 다 인코딩
-            let vCodec = 'libx264';
             try {
-                const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('transcoder_codec') as { value: string } | undefined;
-                if (row && row.value) vCodec = row.value;
-            } catch (e) {}
+                const startTime = seq * SEGMENT_TIME;
+                console.log(`🎬 [ID: ${id}] ${quality} 화질 인코딩 시작 (seq=${seq}, time=${startTime}s)`);
 
-            const isSupported = await checkEncoder(vCodec);
-            if (!isSupported) {
-                console.warn(`⚠️ [ID: ${id}] ${quality} 화질 인코딩 중 선택된 인코더(${vCodec})를 지원하지 않아 libx264로 자동 전환합니다.`);
-                vCodec = 'libx264';
-            }
+                const { width: originalWidth, height: originalHeight } = parseResolution(video.resolution);
+                const { needsScale, targetHeight, targetBitrate, applyScaleFilter } = parseQualitySpec(quality, originalHeight);
 
-            // 대부분의 H.264 하드웨어 인코더(VAAPI/NVENC/QSV/AMF)는 4K(4096x2160) 초과 해상도에서
-            // 극심한 병목이나 실패를 유발하므로 Emby와 동일하게 소프트웨어 처리로 강제 폴백
-            const [origW, origH] = video.resolution ? video.resolution.split('x').map(Number) : [1920, 1080];
-            const originalHeight = isNaN(origH) ? 1080 : origH;
-            const originalWidth = isNaN(origW) ? 1920 : origW;
+                let vCodec = 'libx264';
+                try {
+                    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('transcoder_codec') as { value: string } | undefined;
+                    if (row && row.value) vCodec = row.value;
+                } catch (e) {}
 
-            const isHardwareEncoder = vCodec !== 'libx264' && vCodec !== 'copy';
-            if (isHardwareEncoder && (originalWidth > 4096 || originalHeight > 2160)) {
-                console.log(`⚠️ [ID: ${id}] 해상도(${video.resolution})가 하드웨어 인코더(${vCodec}) 한계를 초과하여 libx264로 자동 하향합니다.`);
-                vCodec = 'libx264';
-            }
-
-            let aCodec = 'aac';
-            if (!needsScale && video.video_codec === 'h264' && video.audio_codec === 'aac') {
-                vCodec = 'copy';
-                aCodec = 'copy';
-            }
-
-            const launchEncoder = (targetVCodec: string, allowFallback: boolean) => {
-                // 입력 옵션: 고속 탐색 (Input Seek) 및 멀티코어 디코딩 활성화
-                const inputOptions = ['-threads', '0'];
-
-                // AV1 비디오인 경우 libdav1d 디코더 강제 사용 (손상된 헤더 무시 및 호환성 확보)
-                if (video.video_codec === 'av1' || video.video_codec === 'av01') {
-                    inputOptions.push('-c:v', 'libdav1d');
+                if (!(await checkEncoder(vCodec))) {
+                    console.warn(`⚠️ [ID: ${id}] ${quality} 화질 인코딩 중 선택된 인코더(${vCodec})를 지원하지 않아 libx264로 자동 전환합니다.`);
+                    vCodec = 'libx264';
                 }
 
-                if (targetVCodec === 'h264_vaapi') {
-                    // -hwaccel_output_format vaapi를 제거하여 디코딩 실패 시(예: 10-bit H.264) 안전하게 소프트웨어 메모리로 폴백되도록 함
-                    const renderDevice = detectedRenderDevices.h264_vaapi || getLinuxRenderDevices()[0] || '/dev/dri/renderD128';
-                    inputOptions.push('-hwaccel', 'vaapi', '-hwaccel_device', renderDevice);
-                } else if (targetVCodec === 'h264_qsv' && os.platform() === 'linux') {
-                    const renderDevice = detectedRenderDevices.h264_qsv || getLinuxRenderDevices()[0] || '/dev/dri/renderD128';
-                    inputOptions.push('-qsv_device', renderDevice);
+                const isHardwareEncoder = vCodec !== 'libx264' && vCodec !== 'copy';
+                if (isHardwareEncoder && (originalWidth > 4096 || originalHeight > 2160)) {
+                    console.log(`⚠️ [ID: ${id}] 해상도(${video.resolution})가 하드웨어 인코더(${vCodec}) 한계를 초과하여 libx264로 자동 하향합니다.`);
+                    vCodec = 'libx264';
                 }
 
-                // 시작 시간 지정 (0초일 때도 타임스탬프 영점화를 위해 항상 강제)
-                inputOptions.push('-ss', String(startTime));
-
-                const outputOptions = [
-                    '-threads', '0', // 멀티코어 인코딩 명시적 활성화
-                    '-c:v', targetVCodec,
-                    '-c:a', aCodec,
-                    '-start_number', String(seq),
-                    '-hls_time', String(SEGMENT_TIME),
-                    '-hls_list_size', '0',
-                    '-hls_flags', 'independent_segments+temp_file',
-                    '-hls_segment_filename', path.join(outDir, 'stream%d.ts'),
-                    '-f', 'hls'
-                ];
-
-                if (targetVCodec === 'h264_qsv') {
-                    outputOptions.push('-pix_fmt', 'nv12');
-                } else if (targetVCodec !== 'copy' && targetVCodec !== 'h264_vaapi') {
-                    outputOptions.push('-pix_fmt', 'yuv420p');
+                let aCodec = 'aac';
+                if (!needsScale && video.video_codec === 'h264' && video.audio_codec === 'aac') {
+                    vCodec = 'copy';
+                    aCodec = 'copy';
                 }
 
-                // PTS 시간 동기화 (재생 시간이 리셋되지 않고 startTime부터 시작되도록 강제)
-                outputOptions.push('-output_ts_offset', String(startTime));
+                const launchEncoder = (targetVCodec: string, allowFallback: boolean) => {
+                    const inputOptions = ['-threads', '0'];
+                    if (video.video_codec === 'av1' || video.video_codec === 'av01') inputOptions.push('-c:v', 'libdav1d');
 
-                if (targetVCodec === 'h264_vaapi') {
-                    if (applyScaleFilter) {
-                        outputOptions.push('-vf', `format=nv12,hwupload,scale_vaapi=w=-2:h=${targetHeight}`);
-                    } else {
-                        // 해상도 변경이 없을 때 픽셀 포맷 변환 및 하드웨어 업로드만 수행
-                        outputOptions.push('-vf', 'format=nv12,hwupload');
+                    if (targetVCodec === 'h264_vaapi') {
+                        const renderDevice = detectedRenderDevices.h264_vaapi || getLinuxRenderDevices()[0] || '/dev/dri/renderD128';
+                        inputOptions.push('-hwaccel', 'vaapi', '-hwaccel_device', renderDevice);
+                    } else if (targetVCodec === 'h264_qsv' && os.platform() === 'linux') {
+                        const renderDevice = detectedRenderDevices.h264_qsv || getLinuxRenderDevices()[0] || '/dev/dri/renderD128';
+                        inputOptions.push('-qsv_device', renderDevice);
                     }
-                } else {
-                    if (applyScaleFilter) {
+                    inputOptions.push('-ss', String(startTime));
+
+                    const outputOptions = [
+                        '-threads', '0',
+                        '-c:v', targetVCodec,
+                        '-c:a', aCodec,
+                        '-start_number', String(seq),
+                        '-hls_time', String(SEGMENT_TIME),
+                        '-hls_list_size', '0',
+                        '-hls_flags', 'independent_segments+temp_file',
+                        '-hls_segment_filename', path.join(outDir, 'stream%d.ts'),
+                        '-f', 'hls',
+                        '-output_ts_offset', String(startTime),
+                    ];
+
+                    if (targetVCodec === 'h264_qsv') outputOptions.push('-pix_fmt', 'nv12');
+                    else if (targetVCodec !== 'copy' && targetVCodec !== 'h264_vaapi') outputOptions.push('-pix_fmt', 'yuv420p');
+
+                    if (targetVCodec === 'h264_vaapi') {
+                        outputOptions.push('-vf', applyScaleFilter ? `format=nv12,hwupload,scale_vaapi=w=-2:h=${targetHeight}` : 'format=nv12,hwupload');
+                    } else if (applyScaleFilter) {
                         outputOptions.push('-vf', `scale=-2:${targetHeight}`);
                     }
-                }
 
-                if (targetBitrate && targetVCodec !== 'copy') {
-                    outputOptions.push('-b:v', targetBitrate);
-                    outputOptions.push('-maxrate', targetBitrate);
-                    const bitVal = parseInt(targetBitrate.replace('M', ''));
-                    if (!isNaN(bitVal)) {
-                        outputOptions.push('-bufsize', `${bitVal * 2}M`);
+                    if (targetBitrate && targetVCodec !== 'copy') {
+                        outputOptions.push('-b:v', targetBitrate, '-maxrate', targetBitrate);
+                        const bitVal = parseInt(targetBitrate.replace('M', ''), 10);
+                        if (!isNaN(bitVal)) outputOptions.push('-bufsize', `${bitVal * 2}M`);
                     }
-                }
 
-                if (targetVCodec === 'libx264') {
-                    outputOptions.push('-preset', 'ultrafast');
-                } else if (targetVCodec === 'h264_nvenc') {
-                    outputOptions.push('-preset', 'p1');
-                } else if (targetVCodec === 'h264_qsv') {
-                    outputOptions.push('-preset', 'veryfast');
-                } else if (targetVCodec === 'h264_amf') {
-                    outputOptions.push('-quality', 'speed');
-                }
+                    if (targetVCodec === 'libx264') outputOptions.push('-preset', 'ultrafast');
+                    else if (targetVCodec === 'h264_nvenc') outputOptions.push('-preset', 'p1');
+                    else if (targetVCodec === 'h264_qsv') outputOptions.push('-preset', 'veryfast');
+                    else if (targetVCodec === 'h264_amf') outputOptions.push('-quality', 'speed');
 
-                if (targetVCodec !== 'copy') {
-                    outputOptions.push('-g', '60');
-                    outputOptions.push('-sc_threshold', '0');
-                    // HLS 탐색 시 깨짐 방지를 위해 반드시 Closed GOP 사용
-                    outputOptions.push('-flags', '+cgop');
-                    // iOS Safari 프리징 방지: 세그먼트 경계(3초)마다 강제로 키프레임(IDR) 삽입 (startTime 보정 포함)
-                    outputOptions.push('-force_key_frames', `expr:gte(t,${startTime}+n_forced*${SEGMENT_TIME})`);
-
-                    if (targetVCodec === 'libx264') {
-                        outputOptions.push('-profile:v', 'high');
+                    if (targetVCodec !== 'copy') {
+                        outputOptions.push('-g', '60', '-sc_threshold', '0', '-flags', '+cgop', '-force_key_frames', `expr:gte(t,${startTime}+n_forced*${SEGMENT_TIME})`);
+                        if (targetVCodec === 'libx264') outputOptions.push('-profile:v', 'high');
                     }
-                }
 
-                const command = ffmpeg(video.file_path)
-                    .inputOptions(inputOptions)
-                    .outputOptions(outputOptions)
-                    .output(path.join(outDir, 'dummy.m3u8'))
-                    .on('start', (cmd) => console.log(`✅ [${quality}] 실행 명령어:`, cmd))
-                    .on('stderr', (stderr) => {
-                        const lowerStderr = stderr.toLowerCase();
-                        if (lowerStderr.includes('error') && !lowerStderr.includes('configuration:') && !lowerStderr.includes('hwaccel initialisation returned error')) {
-                            console.error(`❌ [${quality}] FFmpeg 에러:`, stderr);
-                        }
-                    })
-                    .on('error', (err) => {
-                        const isKilled = err.message.includes('SIGKILL');
-                        if (!isKilled) {
-                            console.error(`❌ [${quality}] 인코딩 실패 (${targetVCodec}):`, err.message);
-                        }
-                        // SIGKILL은 비동기로 뒤늦게 도착할 수 있으므로, 그 사이 다른 요청이 이미
-                        // 새 인코더로 교체했다면(activeStreams[streamKey].command !== command) 절대 건드리지 않음.
-                        // 그렇지 않으면 방금 죽은(과거) 프로세스의 뒤늦은 에러 이벤트가 현재 정상 실행 중인
-                        // 인코더의 참조를 잘못 삭제해 불필요한 추가 재실행을 유발함.
-                        if (activeStreams[streamKey]?.command === command) {
-                            delete activeStreams[streamKey].command;
-                            if (!isKilled && allowFallback && targetVCodec !== 'libx264' && targetVCodec !== 'copy' && !fs.existsSync(filePath)) {
-                                console.warn(`⚠️ [ID: ${id}] 하드웨어 인코더(${targetVCodec}) 런타임 실패로 libx264로 자동 폴백합니다.`);
-                                launchEncoder('libx264', false);
+                    const command = ffmpeg(video.file_path)
+                        .inputOptions(inputOptions)
+                        .outputOptions(outputOptions)
+                        .output(path.join(outDir, 'dummy.m3u8'))
+                        .on('start', (cmd) => console.log(`✅ [${quality}] 실행 명령어:`, cmd))
+                        .on('stderr', (stderr) => {
+                            const lowerStderr = stderr.toLowerCase();
+                            if (lowerStderr.includes('error') && !lowerStderr.includes('configuration:') && !lowerStderr.includes('hwaccel initialisation returned error')) {
+                                console.error(`❌ [${quality}] FFmpeg 에러:`, stderr);
                             }
-                        }
-                    })
-                    .on('end', () => {
-                        console.log(`✅ [ID: ${id}] ${quality} 전체 인코딩 완료`);
-                    });
+                        })
+                        .on('error', (err) => {
+                            const isKilled = err.message.includes('SIGKILL');
+                            if (!isKilled) console.error(`❌ [${quality}] 인코딩 실패 (${targetVCodec}):`, err.message);
+                            if (activeStreams[streamKey]?.command === command) {
+                                delete activeStreams[streamKey].command;
+                                if (!isKilled && allowFallback && targetVCodec !== 'libx264' && targetVCodec !== 'copy' && !fs.existsSync(filePath)) {
+                                    console.warn(`⚠️ [ID: ${id}] 하드웨어 인코더(${targetVCodec}) 런타임 실패로 libx264로 자동 폴백합니다.`);
+                                    launchEncoder('libx264', false);
+                                }
+                            }
+                        })
+                        .on('end', () => console.log(`✅ [ID: ${id}] ${quality} 전체 인코딩 완료`));
 
-                activeStreams[streamKey].command = command;
-                activeStreams[streamKey].currentSeq = seq;
-                activeStreams[streamKey].startTime = Date.now();
-                activeStreams[streamKey].launching = false;
-                command.run();
-            };
+                    activeStreams[streamKey].command = command;
+                    activeStreams[streamKey].currentSeq = seq;
+                    activeStreams[streamKey].startTime = Date.now();
+                    activeStreams[streamKey].launching = false;
+                    command.run();
+                };
 
-            launchEncoder(vCodec, true);
+                launchEncoder(vCodec, true);
+            } catch (launchErr) {
+                if (activeStreams[streamKey]) activeStreams[streamKey].launching = false;
+                throw launchErr;
+            }
         }
     }
 
-    // TS 조각이 완전히 생성되었는지 확인하는 함수
-    const isSegmentReady = () => {
-        // 빠른 경로: 파일이 존재하면 대부분의 경우 완료된 것
-        // (hls_flags temp_file 덕분에 .tmp → .ts 리네임 완료 = 100% 완성)
+    const isSegmentReady = (): boolean => {
         if (!fs.existsSync(filePath)) return false;
-
-        // 인코딩 명령어가 없으면 캐시된 파일이므로 존재하기만 하면 완료된 것으로 간주
-        if (!activeStreams[streamKey]?.command) return true;
-
-        // 만약 요청한 조각이 현재 실행 중인 FFmpeg의 시작 번호보다 이전 것이라면, 
-        // 이는 과거의 인코딩으로 이미 100% 완료된 파일이므로 dummy.m3u8을 확인할 필요 없이 바로 반환
-        if (activeStreams[streamKey].currentSeq !== undefined && seq < activeStreams[streamKey].currentSeq) {
-            return true;
-        }
-
-        // FFmpeg가 현재 인코딩 중인 최신 세그먼트: dummy.m3u8에 파일 이름이 쓰여졌는지 확인
+        const stream = activeStreams[streamKey];
+        if (!stream?.command) return true;
+        if (stream.currentSeq !== undefined && seq < stream.currentSeq) return true;
         const dummyM3u8Path = path.join(outDir, 'dummy.m3u8');
-        if (fs.existsSync(dummyM3u8Path)) {
-            try {
-                return fs.readFileSync(dummyM3u8Path, 'utf8').includes(file);
-            } catch (e) {
-                return false;
-            }
+        if (!fs.existsSync(dummyM3u8Path)) return false;
+        try {
+            return fs.readFileSync(dummyM3u8Path, 'utf8').includes(file);
+        } catch (e) {
+            return false;
         }
-        return false;
     };
 
-    // TS 세그먼트 응답 헤더 설정 및 전송
     const sendSegment = () => {
+        if (res.headersSent || res.writableEnded) return;
         res.setHeader('Content-Type', 'video/MP2T');
         res.setHeader('Cache-Control', 'public, max-age=3600');
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.sendFile(filePath);
     };
 
-    // 파일 생성 대기 (폴링 — 100ms 간격으로 빠르게 체크)
-    const serveFile = () => {
-        if (isSegmentReady()) {
-            return sendSegment();
-        }
-        
-        let attempts = 0;
-        const maxAttempts = 300; // 300 * 100ms = 30초 대기
-        
-        const checkFileExists = setInterval(() => {
-            if (isSegmentReady()) {
-                clearInterval(checkFileExists);
-                sendSegment();
-            } else {
-                attempts++;
-                if (attempts >= maxAttempts) {
-                    clearInterval(checkFileExists);
-                    if (!res.headersSent) res.status(500).send('스트리밍 준비 시간 초과');
-                }
-            }
-        }, 100);
-    };
+    if (isSegmentReady()) return sendSegment();
 
-    serveFile();
+    let attempts = 0;
+    const maxAttempts = 300; // 300 * 100ms = 30초 대기
+    const checkFileExists = setInterval(() => {
+        if (isSegmentReady()) {
+            clearInterval(checkFileExists);
+            sendSegment();
+        } else if (++attempts >= maxAttempts) {
+            clearInterval(checkFileExists);
+            if (!res.headersSent && !res.writableEnded) res.status(500).send('스트리밍 준비 시간 초과');
+        }
+    }, 100);
+
+    // 클라이언트 연결 종료 시 즉시 폴링 타이머 해제 (불필요한 디스크 I/O 누수 방지)
+    req.on('close', () => clearInterval(checkFileExists));
 });
 
 // ⚡ 속도 측정용 더미 다운로드 API

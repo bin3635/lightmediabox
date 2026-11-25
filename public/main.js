@@ -134,6 +134,7 @@ let isDirectPlaySupported = false;
 // 잘못 적용하는 문제가 있었음. 매 loadQuality() 호출마다 토큰을 새로 발급하고, 콜백
 // 실행 시점에 자신의 토큰이 최신인지 확인해 오래된 콜백을 무시하도록 한다.
 let qualityLoadToken = 0;
+let activeMediaCleanup = null;
 let controlsTimeout = null;
 let isSeeking = false;
 let currentBrowsePath = '';
@@ -183,10 +184,29 @@ const iconAsc = document.querySelector('.icon-asc');
 const iconDesc = document.querySelector('.icon-desc');
 
 // ─── 뷰 전환 로직 ───
+function clearPendingMediaLoad() {
+    if (activeMediaCleanup) {
+        activeMediaCleanup();
+        activeMediaCleanup = null;
+    }
+}
+
+function resetProgressUI() {
+    progressPlayed.style.width = '0%';
+    progressBuffered.style.width = '0%';
+    progressThumb.style.left = '0%';
+    timeDisplay.textContent = '0:00 / 0:00';
+}
+
 function showLibrary() {
     isPlayerMode = false;
+    isImageViewerMode = false;
+    qualityLoadToken++;
+    clearPendingMediaLoad();
+    cancelScheduledLoading();
+    hideLoading();
     document.body.classList.remove('player-mode');
-    // 플레이어 초기화 및 백그라운드 인코딩 즉시 종료
+
     if (hls) {
         hls.destroy();
         hls = null;
@@ -198,6 +218,7 @@ function showLibrary() {
     videoPlayer.pause();
     videoPlayer.removeAttribute('src');
     videoPlayer.load();
+    resetProgressUI();
 
     playerView.classList.remove('visible');
     playerView.classList.add('hidden');
@@ -212,7 +233,7 @@ function showLibrary() {
     }
 
     if (document.fullscreenElement) {
-        document.exitFullscreen().catch(() => { });
+        document.exitFullscreen().catch(() => {});
     }
 }
 
@@ -618,27 +639,38 @@ if (btnNextImage) {
 // ─── 영상 선택 및 재생 ───
 async function selectVideo(id) {
     currentVideoId = id;
+    resetProgressUI();
     showPlayer();
+    showLoading('영상 정보 불러오는 중...');
 
-    // 화질 목록 로드
-    const res = await fetch(`/api/hls/${id}/qualities`);
-    const data = await res.json();
-    qualities = data.qualities || [];
-    isDirectPlaySupported = data.isDirectPlaySupported || false;
+    try {
+        const res = await fetch(`/api/hls/${id}/qualities`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
 
-    // iOS Safari 등 모바일 환경에서 4K(2160p)를 초과하는 초고화질(6000p 등) 디코딩 시도시 프리징 발생 방지
-    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-    let defaultQuality = 'original';
-    if (isIOS && qualities.length > 0 && qualities[0].height > 2160) {
-        // 4K를 초과하는 경우 가장 높은 안전한 화질(예: 1080p)로 자동 하향
-        const safeQuality = qualities.find(q => q.name !== 'original' && q.height <= 2160);
-        if (safeQuality) {
-            defaultQuality = safeQuality.name;
-            console.log(`⚠️ iOS 기기에서 초고화질 재생 프리징을 방지하기 위해 기본 화질을 ${defaultQuality}로 하향합니다.`);
+        // 요청 도중 플레이어를 닫거나 다른 영상으로 전환된 경우 무시
+        if (currentVideoId !== id || !isPlayerMode) return;
+
+        qualities = data.qualities || [];
+        isDirectPlaySupported = Boolean(data.isDirectPlaySupported);
+
+        // iOS 기기에서 4K 초과 초고화질 디코딩 시 프리징 방지
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        let defaultQuality = 'original';
+        if (isIOS && qualities.length > 0 && qualities[0].height > 2160) {
+            const safeQuality = qualities.find(q => q.name !== 'original' && q.height <= 2160);
+            if (safeQuality) {
+                defaultQuality = safeQuality.name;
+                console.log(`⚠️ iOS 기기에서 초고화질 재생 프리징을 방지하기 위해 기본 화질을 ${defaultQuality}로 하향합니다.`);
+            }
         }
-    }
 
-    loadQuality(defaultQuality);
+        loadQuality(defaultQuality);
+    } catch (err) {
+        console.error('영상 정보 로드 실패:', err);
+        hideLoading();
+        showToast('영상 정보를 불러오지 못했습니다.', 'error');
+    }
 }
 
 // ─── 화질 로드 (수동 전환 핵심 로직) ───
@@ -647,72 +679,74 @@ function loadQuality(quality) {
     const savedTime = videoPlayer.currentTime || 0;
     const wasPaused = videoPlayer.paused;
 
+    clearPendingMediaLoad();
+    cancelScheduledLoading();
     currentQuality = quality;
     showLoading('화질 변환 중...');
     updateQualityMenu();
 
-    // 기존 HLS 파괴
     if (hls) {
         hls.destroy();
         hls = null;
     }
 
-    // 브라우저 비디오 디코더 완벽 초기화 (Safari 버그 방지)
+    // 브라우저 비디오 디코더 초기화 (Safari 버그 방지)
     videoPlayer.removeAttribute('src');
     videoPlayer.load();
 
-    // Direct Play 지원 여부에 따라 분기
+    const resumeIfNeeded = () => {
+        if (!wasPaused || savedTime === 0) {
+            videoPlayer.play().catch(() => {});
+        }
+    };
+
+    // 1. Direct Play (TS 변환 없는 원본 스트리밍)
     if (quality === 'original' && isDirectPlaySupported) {
         console.log('⚡ Direct Play 모드로 스트리밍 (TS 변환 없음)');
-        videoPlayer.src = `/api/video/${currentVideoId}/direct?token=${window.streamToken || ''}`;
-        if (savedTime > 0) {
-            videoPlayer.currentTime = savedTime;
-        }
-        if (!wasPaused || savedTime === 0) {
-            videoPlayer.play().catch(() => { });
-        }
-
-        // 실제 재생 가능해지면 로딩 해제
+        let seekApplied = savedTime <= 0;
+        const onLoadedMetadata = () => {
+            if (myLoadToken !== qualityLoadToken) return;
+            if (!seekApplied && savedTime > 0) {
+                seekApplied = true;
+                videoPlayer.currentTime = savedTime;
+            }
+            resumeIfNeeded();
+        };
         const onCanPlay = () => {
-            videoPlayer.removeEventListener('canplay', onCanPlay);
-            if (myLoadToken !== qualityLoadToken) return; // 더 최신 화질 전환이 이미 시작됨
+            clearPendingMediaLoad();
+            if (myLoadToken !== qualityLoadToken) return;
             hideLoading();
         };
+        activeMediaCleanup = () => {
+            videoPlayer.removeEventListener('loadedmetadata', onLoadedMetadata);
+            videoPlayer.removeEventListener('canplay', onCanPlay);
+        };
+        videoPlayer.addEventListener('loadedmetadata', onLoadedMetadata);
         videoPlayer.addEventListener('canplay', onCanPlay);
+        videoPlayer.src = `/api/video/${currentVideoId}/direct?token=${window.streamToken || ''}`;
+        videoPlayer.load();
         return;
     }
 
-    // HLS 트랜스코딩 / 리먹싱 (Direct Play가 불가능하거나 480p 등을 선택한 경우)
-    // startTime을 서버에 전달하면 플레이리스트에 #EXT-X-START가 포함되어, 플레이어가
-    // 0초 세그먼트를 거쳐가지 않고 처음부터 재생 위치의 세그먼트를 요청하게 된다.
+    // 2. HLS 스트리밍 (#EXT-X-START로 처음부터 목표 위치 세그먼트 요청)
     const m3u8Url = `/api/hls/${currentVideoId}/${quality}/index.m3u8?token=${window.streamToken || ''}${savedTime > 0 ? `&startTime=${savedTime}` : ''}`;
 
-    // Safari(Mac/iOS)의 경우 네이티브 HLS 지원이 훨씬 안정적이므로 최우선으로 사용합니다.
     if (videoPlayer.canPlayType('application/vnd.apple.mpegurl')) {
+        const onNativeReady = () => {
+            clearPendingMediaLoad();
+            if (myLoadToken !== qualityLoadToken) return;
+            hideLoading();
+            if (savedTime > 0) videoPlayer.currentTime = savedTime;
+            resumeIfNeeded();
+        };
+        activeMediaCleanup = () => {
+            videoPlayer.removeEventListener('canplay', onNativeReady);
+            videoPlayer.removeEventListener('loadedmetadata', onNativeReady);
+        };
+        videoPlayer.addEventListener('canplay', onNativeReady);
+        videoPlayer.addEventListener('loadedmetadata', onNativeReady);
         videoPlayer.src = m3u8Url;
         videoPlayer.load();
-
-        // load() 직후 currentTime을 지정하면 load()의 미디어 엘리먼트 초기화 과정에서
-        // 재생 위치가 강제로 0으로 리셋되어버림(HTML5 스펙 동작). 그래서 반드시
-        // load() 이후, 메타데이터가 준비된 시점(loadedmetadata/canplay)에 지정해야 함.
-        // (예전 코드는 load() 호출 직전에 currentTime을 설정해서 항상 0으로 초기화된 뒤
-        // 시작 → seq=0부터 인코딩이 시작되는 원인이었음. Windows Edge는 네이티브 HLS를
-        // "maybe"로 지원하므로 이 브랜치를 탄다.)
-        const onNativeCanPlay = () => {
-            videoPlayer.removeEventListener('canplay', onNativeCanPlay);
-            videoPlayer.removeEventListener('loadedmetadata', onNativeCanPlay);
-            if (myLoadToken !== qualityLoadToken) return; // 더 최신 화질 전환이 이미 시작됨 — 오래된 savedTime 적용 방지
-            hideLoading();
-            if (savedTime > 0) {
-                videoPlayer.currentTime = savedTime;
-            }
-            if (!wasPaused || savedTime === 0) {
-                videoPlayer.play().catch(() => { });
-            }
-        };
-        videoPlayer.addEventListener('canplay', onNativeCanPlay);
-        videoPlayer.addEventListener('loadedmetadata', onNativeCanPlay);
-
     } else if (Hls.isSupported()) {
         hls = new Hls({
             startPosition: savedTime > 0 ? savedTime : -1,
@@ -733,54 +767,42 @@ function loadQuality(quality) {
         hls.attachMedia(videoPlayer);
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-            if (myLoadToken !== qualityLoadToken) return; // 더 최신 화질 전환이 이미 시작됨
-            // startPosition 옵션만 믿으면, hls.js가 내부적으로 seek를 적용하기 전에
-            // play()가 먼저 실행되어 브라우저가 기본 위치(0초)의 프래그먼트도 함께
-            // 요청하는 경우가 있었음 (예: 9초 지점에서 화질 변경 시 seq=3과 seq=0이
-            // 거의 동시에 요청되어 서버가 "탐색 감지"로 오인, 불필요한 재시작 발생).
-            // Direct Play/Safari 네이티브 분기와 동일하게 currentTime을 명시적으로
-            // 지정해 정상적인 seek 경로를 강제한다.
-            if (savedTime > 0) {
-                videoPlayer.currentTime = savedTime;
-            }
-            if (!wasPaused || savedTime === 0) {
-                videoPlayer.play().catch(() => { });
-            }
+            if (myLoadToken !== qualityLoadToken) return;
+            if (savedTime > 0) videoPlayer.currentTime = savedTime;
+            resumeIfNeeded();
         });
 
         const onCanPlay = () => {
-            videoPlayer.removeEventListener('canplay', onCanPlay);
+            clearPendingMediaLoad();
             if (myLoadToken !== qualityLoadToken) return;
             hideLoading();
+        };
+        activeMediaCleanup = () => {
+            videoPlayer.removeEventListener('canplay', onCanPlay);
         };
         videoPlayer.addEventListener('canplay', onCanPlay);
 
         hls.on(Hls.Events.ERROR, (event, data) => {
-            if (data.fatal) {
-                switch (data.type) {
-                    case Hls.ErrorTypes.NETWORK_ERROR:
-                        console.warn('HLS 네트워크 오류, 자동 복구 시도...');
-                        hls.startLoad();
-                        break;
-                    case Hls.ErrorTypes.MEDIA_ERROR:
-                        console.warn('HLS 미디어 오류, 자동 복구 시도...');
-                        hls.recoverMediaError();
-                        break;
-                    default:
-                        console.error('HLS 치명적 오류:', data);
-                        hideLoading();
-                        break;
-                }
+            if (!data.fatal || !hls) return;
+            switch (data.type) {
+                case Hls.ErrorTypes.NETWORK_ERROR:
+                    console.warn('HLS 네트워크 오류, 자동 복구 시도...');
+                    hls.startLoad();
+                    break;
+                case Hls.ErrorTypes.MEDIA_ERROR:
+                    console.warn('HLS 미디어 오류, 자동 복구 시도...');
+                    hls.recoverMediaError();
+                    break;
+                default:
+                    console.error('HLS 치명적 오류:', data);
+                    hideLoading();
+                    break;
             }
         });
     }
 }
 
-// ─── 버퍼링 상태 감지 (로딩 인디케이터 자동 표시) ───
-// waiting/stalled는 실제로는 재생이 끊기지 않았는데도 아주 짧게(오탐지) 발동하는
-// 경우가 흔함(특히 MSE/hls.js 재생). 발동 즉시 오버레이를 띄우면 정상 재생 중에도
-// 화면이 번쩍이므로, 살짝(200ms) 지연시켜 그 사이 playing/timeupdate로 정상 재생이
-// 확인되면 아예 표시하지 않고, 진짜로 버퍼링이 지속될 때만 오버레이를 띄운다.
+// ─── 버퍼링 상태 감지 (200ms 디바운스로 짧은 오탐지 번쩍임 방지) ───
 let loadingShowTimer = null;
 function scheduleShowLoading(text) {
     if (loadingShowTimer) return;
@@ -797,35 +819,16 @@ function cancelScheduledLoading() {
 }
 
 videoPlayer.addEventListener('waiting', () => {
-    // 일시정지 상태에서는 waiting이 반복적으로 발동할 수 있는데, 그때마다 예약을 걸면
-    // pause 핸들러가 한 번 해제해도 다시 떠버려 고착된 것처럼 보임. 일시정지는 사용자가
-    // 의도한 상태이므로 애초에 예약 자체를 하지 않는다.
     if (isPlayerMode && currentVideoId && !videoPlayer.paused) {
         scheduleShowLoading('버퍼링 중...');
     }
-});
-videoPlayer.addEventListener('playing', () => {
-    cancelScheduledLoading();
-    hideLoading();
 });
 videoPlayer.addEventListener('stalled', () => {
     if (isPlayerMode && currentVideoId && !videoPlayer.paused) {
         scheduleShowLoading('데이터 대기 중...');
     }
 });
-// timeupdate가 발생한다는 건 재생 시간이 실제로 흐르고 있다는 확실한 증거이므로,
-// 예약된 표시를 취소하고(아직 안 떴다면 번쩍임 자체를 방지) 이미 떠 있다면 해제한다.
-videoPlayer.addEventListener('timeupdate', () => {
-    if (!videoPlayer.paused && !videoPlayer.seeking) {
-        cancelScheduledLoading();
-        hideLoading();
-    }
-});
-// 일시정지 상태에서는 playing/timeupdate가 발생하지 않으므로, 일시정지 직전/중에
-// waiting이나 stalled가 한 번이라도 발동했다면 오버레이가 해제될 방법이 없어 계속
-// 떠 있는 상태로 고착되는 문제가 있었음. 일시정지는 사용자의 의도된 상태이므로
-// 버퍼링 표시가 필요 없다 — pause 시 예약된 표시를 취소하고 즉시 해제한다.
-videoPlayer.addEventListener('pause', () => {
+videoPlayer.addEventListener('playing', () => {
     cancelScheduledLoading();
     hideLoading();
 });
@@ -840,9 +843,7 @@ function updateQualityMenu() {
         option.innerHTML = `<span class="check">${q.name === currentQuality ? '✓' : ''}</span><span>${q.label}</span>`;
         option.onclick = (e) => {
             e.stopPropagation();
-            if (q.name !== currentQuality) {
-                loadQuality(q.name);
-            }
+            if (q.name !== currentQuality) loadQuality(q.name);
             qualityMenu.classList.remove('visible');
         };
         qualityMenu.appendChild(option);
@@ -861,11 +862,8 @@ document.addEventListener('click', () => {
 // ─── 재생/정지 ───
 function togglePlay() {
     if (!currentVideoId || !isPlayerMode) return;
-    if (videoPlayer.paused) {
-        videoPlayer.play().catch(() => { });
-    } else {
-        videoPlayer.pause();
-    }
+    if (videoPlayer.paused) videoPlayer.play().catch(() => {});
+    else videoPlayer.pause();
 }
 
 btnPlay.onclick = togglePlay;
@@ -879,6 +877,8 @@ videoPlayer.addEventListener('play', () => {
 });
 
 videoPlayer.addEventListener('pause', () => {
+    cancelScheduledLoading();
+    hideLoading();
     iconPlay.style.display = 'block';
     iconPause.style.display = 'none';
     centerPlay.classList.add('visible');
@@ -886,17 +886,13 @@ videoPlayer.addEventListener('pause', () => {
 
 btnRepeat.onclick = () => {
     isRepeat = !isRepeat;
-    if (isRepeat) {
-        btnRepeat.classList.add('active');
-    } else {
-        btnRepeat.classList.remove('active');
-    }
+    btnRepeat.classList.toggle('active', isRepeat);
 };
 
 videoPlayer.addEventListener('ended', () => {
     if (isRepeat) {
         videoPlayer.currentTime = 0;
-        videoPlayer.play();
+        videoPlayer.play().catch(() => {});
     } else {
         iconPlay.style.display = 'block';
         iconPause.style.display = 'none';
@@ -920,39 +916,51 @@ function updateVolumeUI() {
     const muted = videoPlayer.muted || videoPlayer.volume === 0;
     iconVol.style.display = muted ? 'none' : 'block';
     iconMuted.style.display = muted ? 'block' : 'none';
-    if (!videoPlayer.muted) {
-        volumeSlider.value = videoPlayer.volume;
-    }
+    if (!videoPlayer.muted) volumeSlider.value = videoPlayer.volume;
 }
 
 // ─── 프로그레스 바 ───
 videoPlayer.addEventListener('timeupdate', () => {
-    if (isSeeking || !isPlayerMode) return;
-    updateProgress();
+    if (!videoPlayer.paused && !videoPlayer.seeking) {
+        cancelScheduledLoading();
+        hideLoading();
+    }
+    if (!isSeeking && isPlayerMode) {
+        updateProgress();
+    }
 });
 
 function updateProgress() {
     const duration = videoPlayer.duration || 0;
+    if (duration <= 0 || !isFinite(duration)) return;
+
     const current = videoPlayer.currentTime || 0;
-    if (duration > 0) {
-        const pct = (current / duration) * 100;
-        progressPlayed.style.width = pct + '%';
-        progressThumb.style.left = pct + '%';
-        timeDisplay.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
-    }
+    const pct = Math.min(100, (current / duration) * 100);
+    progressPlayed.style.width = pct + '%';
+    progressThumb.style.left = pct + '%';
+    timeDisplay.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
 
     if (videoPlayer.buffered.length > 0) {
         const buffEnd = videoPlayer.buffered.end(videoPlayer.buffered.length - 1);
-        progressBuffered.style.width = (buffEnd / duration) * 100 + '%';
+        progressBuffered.style.width = Math.min(100, (buffEnd / duration) * 100) + '%';
     }
 }
 
+// 드래그 중에는 UI만 미리보기로 갱신하고 마우스를 놓을 때 1회만 currentTime 반영
+// (드래그 중 픽셀마다 FFmpeg 인코더가 재시작되는 서버 부하 방지)
 progressContainer.addEventListener('mousedown', (e) => {
+    const duration = videoPlayer.duration || 0;
+    if (duration <= 0 || !isFinite(duration)) return;
+
     isSeeking = true;
-    seek(e);
-    const onMove = (e) => seek(e);
+    let pendingTime = previewSeek(e, duration);
+
+    const onMove = (moveEvent) => {
+        pendingTime = previewSeek(moveEvent, duration);
+    };
     const onUp = () => {
         isSeeking = false;
+        videoPlayer.currentTime = pendingTime;
         document.removeEventListener('mousemove', onMove);
         document.removeEventListener('mouseup', onUp);
     };
@@ -960,14 +968,14 @@ progressContainer.addEventListener('mousedown', (e) => {
     document.addEventListener('mouseup', onUp);
 });
 
-function seek(e) {
+function previewSeek(e, duration) {
     const rect = progressContainer.getBoundingClientRect();
     const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const duration = videoPlayer.duration || 0;
-    videoPlayer.currentTime = pct * duration;
+    const targetTime = pct * duration;
     progressPlayed.style.width = (pct * 100) + '%';
     progressThumb.style.left = (pct * 100) + '%';
-    timeDisplay.textContent = `${formatTime(pct * duration)} / ${formatTime(duration)}`;
+    timeDisplay.textContent = `${formatTime(targetTime)} / ${formatTime(duration)}`;
+    return targetTime;
 }
 
 // ─── 전체화면 ───
@@ -1027,8 +1035,13 @@ document.addEventListener('fullscreenchange', handleFsChange);
 document.addEventListener('webkitfullscreenchange', handleFsChange);
 
 // ─── 컨트롤 자동 숨김 ───
+let lastControlsMoveAt = 0;
 playerWrapper.addEventListener('mousemove', () => {
     if (!isPlayerMode) return;
+    const now = Date.now();
+    if (now - lastControlsMoveAt < 150) return;
+    lastControlsMoveAt = now;
+
     playerWrapper.classList.add('controls-visible');
     clearTimeout(controlsTimeout);
     controlsTimeout = setTimeout(() => {
@@ -2040,16 +2053,15 @@ function castCurrentVideo() {
     const origin = window.location.origin;
     let url = '';
 
-    // HLS.js나 native 플레이어에 공급되는 url과 동일하게 전송
-    if (currentQuality === 'original') {
-        url = `${origin}/api/video/${currentVideoId}/direct?token=${window.streamToken || ''}`;
-    } else {
-        url = `${origin}/api/hls/${currentVideoId}/${currentQuality}/index.m3u8?token=${window.streamToken || ''}`;
-    }
+    const useDirectPlay = currentQuality === 'original' && isDirectPlaySupported;
+    url = useDirectPlay
+        ? `${origin}/api/video/${currentVideoId}/direct?token=${window.streamToken || ''}`
+        : `${origin}/api/hls/${currentVideoId}/${currentQuality}/index.m3u8?token=${window.streamToken || ''}`;
 
-    const mediaInfo = new chrome.cast.media.MediaInfo(url, currentQuality === 'original' ? 'video/mp4' : 'application/x-mpegURL');
+    const mediaInfo = new chrome.cast.media.MediaInfo(url, useDirectPlay ? 'video/mp4' : 'application/x-mpegURL');
 
-    const videoData = allVideos.find(v => String(v.id) === String(currentVideoId));
+    const videoList = cachedSortedVideos.length > 0 ? cachedSortedVideos : (lastLoadedData.videos || []);
+    const videoData = videoList.find(v => String(v.id) === String(currentVideoId));
     if (videoData) {
         const metadata = new chrome.cast.media.GenericMediaMetadata();
         metadata.title = videoData.file_name;
