@@ -1398,6 +1398,8 @@ async function loadTranscoderSettings() {
 
 // ─── FFmpeg 관리 로직 ───
 let ffmpegUpdatePollingTimer = null;
+let isFfmpegPolling = false;
+let ffmpegHideProgressTimer = null;
 
 async function loadFfmpegSettings(forceCheck = false) {
     const currentVersionEl = document.getElementById('ffmpeg-current-version');
@@ -1421,6 +1423,7 @@ async function loadFfmpegSettings(forceCheck = false) {
         const res = await fetch(endpoint, {
             method: forceCheck ? 'POST' : 'GET'
         });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
 
         const current = data.current || {};
@@ -1488,6 +1491,10 @@ async function loadFfmpegSettings(forceCheck = false) {
 }
 
 function showFfmpegProgress(state) {
+    if (ffmpegHideProgressTimer) {
+        clearTimeout(ffmpegHideProgressTimer);
+        ffmpegHideProgressTimer = null;
+    }
     const container = document.getElementById('ffmpeg-progress-container');
     const statusEl = document.getElementById('ffmpeg-progress-status');
     const percentEl = document.getElementById('ffmpeg-progress-percent');
@@ -1501,40 +1508,64 @@ function showFfmpegProgress(state) {
 }
 
 function hideFfmpegProgress() {
+    if (ffmpegHideProgressTimer) {
+        clearTimeout(ffmpegHideProgressTimer);
+        ffmpegHideProgressTimer = null;
+    }
     const container = document.getElementById('ffmpeg-progress-container');
     if (container) {
         container.style.display = 'none';
     }
 }
 
-function startFfmpegPolling() {
-    if (ffmpegUpdatePollingTimer) return;
+function stopFfmpegPolling() {
+    isFfmpegPolling = false;
+    if (ffmpegUpdatePollingTimer) {
+        clearTimeout(ffmpegUpdatePollingTimer);
+        ffmpegUpdatePollingTimer = null;
+    }
+}
 
-    ffmpegUpdatePollingTimer = setInterval(async () => {
+function startFfmpegPolling() {
+    if (isFfmpegPolling) return;
+    isFfmpegPolling = true;
+
+    const poll = async () => {
+        if (!isFfmpegPolling) return;
+
         try {
             const res = await fetch('/api/settings/ffmpeg/progress');
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const state = await res.json();
+
+            if (!isFfmpegPolling) return;
 
             showFfmpegProgress(state);
 
             if (!state.isUpdating) {
-                clearInterval(ffmpegUpdatePollingTimer);
-                ffmpegUpdatePollingTimer = null;
+                stopFfmpegPolling();
 
                 if (state.step === 'completed') {
                     showToast(state.message || 'FFmpeg 업데이트가 완료되었습니다!', 'success');
-                    setTimeout(() => {
+                    ffmpegHideProgressTimer = setTimeout(() => {
                         hideFfmpegProgress();
                     }, 3000);
                 } else if (state.step === 'error') {
                     showToast(state.error || 'FFmpeg 업데이트 중 오류가 발생했습니다.', 'error');
                 }
                 loadFfmpegSettings();
+                return;
             }
         } catch (err) {
             console.error('진행 상태 폴링 오류:', err);
         }
-    }, 600);
+
+        if (isFfmpegPolling) {
+            ffmpegUpdatePollingTimer = setTimeout(poll, 600);
+        }
+    };
+
+    ffmpegUpdatePollingTimer = setTimeout(poll, 600);
 }
 
 // FFmpeg 관련 이벤트 바인딩

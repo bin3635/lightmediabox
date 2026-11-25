@@ -1,8 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execSync } from 'child_process';
+import { execSync, execFile } from 'child_process';
+import { promisify } from 'util';
 import https from 'https';
+
+const execFileAsync = promisify(execFile);
 
 const FFMPEG_DIR = path.resolve(process.cwd(), 'ffmpeg');
 const VERSION_FILE = path.join(FFMPEG_DIR, 'version.json');
@@ -289,7 +292,8 @@ export const checkLatestRelease = async (force: boolean = false): Promise<Ffmpeg
         const res = await fetch('https://api.github.com/repos/jellyfin/jellyfin-ffmpeg/releases/latest', {
             headers: {
                 'User-Agent': 'LightMediaBox'
-            }
+            },
+            signal: AbortSignal.timeout(10000)
         });
 
         if (res.ok) {
@@ -328,14 +332,16 @@ export const checkLatestRelease = async (force: boolean = false): Promise<Ffmpeg
     try {
         const platform = os.platform();
         let fallbackUrl = '';
+        const arch = os.arch();
         if (platform === 'win32') {
             fallbackUrl = 'https://repo.jellyfin.org/files/ffmpeg/windows/latest-8.x/win64/';
         } else if (platform === 'linux') {
-            fallbackUrl = 'https://repo.jellyfin.org/files/ffmpeg/linux/latest-8.x/amd64/';
+            const linuxArch = arch === 'arm64' ? 'arm64' : 'amd64';
+            fallbackUrl = `https://repo.jellyfin.org/files/ffmpeg/linux/latest-8.x/${linuxArch}/`;
         }
 
         if (fallbackUrl) {
-            const res = await fetch(fallbackUrl);
+            const res = await fetch(fallbackUrl, { signal: AbortSignal.timeout(10000) });
             if (res.ok) {
                 const html = await res.text();
                 const match = html.match(/jellyfin-ffmpeg_([0-9\.\-]+)_portable[^\"]+/i);
@@ -443,13 +449,9 @@ export const updateFfmpeg = async (): Promise<{ success: boolean; message: strin
         };
 
         if (isZip) {
-            execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${extractTempPath}' -Force"`, {
-                stdio: 'ignore'
-            });
+            await execFileAsync('powershell', ['-NoProfile', '-Command', `Expand-Archive -Path '${archivePath}' -DestinationPath '${extractTempPath}' -Force`]);
         } else {
-            execSync(`tar -xf "${archivePath}" -C "${extractTempPath}"`, {
-                stdio: 'ignore'
-            });
+            await execFileAsync('tar', ['-xf', archivePath, '-C', extractTempPath]);
         }
 
         // 바이너리 파일 교체 (90% ~ 100%)
@@ -478,8 +480,8 @@ export const updateFfmpeg = async (): Promise<{ success: boolean; message: strin
             if (fs.existsSync(localFfmpeg)) fs.renameSync(localFfmpeg, backupFfmpeg);
             if (fs.existsSync(localFfprobe)) fs.renameSync(localFfprobe, backupFfprobe);
 
-            fs.copyFileSync(foundFfmpeg, localFfmpeg);
-            fs.copyFileSync(foundFfprobe, localFfprobe);
+            await fs.promises.copyFile(foundFfmpeg, localFfmpeg);
+            await fs.promises.copyFile(foundFfprobe, localFfprobe);
 
             if (platform !== 'win32') {
                 fs.chmodSync(localFfmpeg, 0o755);
