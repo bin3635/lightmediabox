@@ -3,17 +3,14 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import cp from 'child_process';
-import ffmpeg from 'fluent-ffmpeg';
 import db from './db';
 import crypto from 'crypto';
 import { VideoRecord } from './types';
 import { getConfig, saveConfig } from './config';
 import { startScanner, stopScanner } from './scanner';
-import { getFfmpegPath, getFfprobePath, getFfmpegInfo, checkLatestRelease, updateFfmpeg, getUpdateState, onFfmpegUpdated } from './setup-ffmpeg';
+import { getFfmpegPath, getFfmpegInfo, checkLatestRelease, updateFfmpeg, getUpdateState, onFfmpegUpdated } from './setup-ffmpeg';
 
 const router = express.Router();
-ffmpeg.setFfmpegPath(getFfmpegPath());
-ffmpeg.setFfprobePath(getFfprobePath());
 const HLS_TEMP_DIR = path.resolve(process.cwd(), 'hls_temp');
 const SEGMENT_TIME = 3;
 
@@ -21,7 +18,7 @@ if (!fs.existsSync(HLS_TEMP_DIR)) fs.mkdirSync(HLS_TEMP_DIR, { recursive: true }
 
 // ⚡ 화질별 독립 스트림 관리: 키 = "${videoId}_${quality}"
 const activeStreams: Record<string, { 
-    command?: ffmpeg.FfmpegCommand; 
+    command?: cp.ChildProcess;
     timeout?: NodeJS.Timeout; 
     currentSeq?: number;
     startTime?: number;
@@ -93,21 +90,30 @@ const clearEncoderCache = () => {
     delete detectedRenderDevices.h264_vaapi;
     delete detectedRenderDevices.h264_qsv;
     probeAllInFlight = null;
-    ffmpeg.setFfmpegPath(getFfmpegPath());
-    ffmpeg.setFfprobePath(getFfprobePath());
 };
 
 onFfmpegUpdated(clearEncoderCache);
 
+const killedProcesses = new WeakSet<cp.ChildProcess>();
+const killEncoderProcess = (proc: cp.ChildProcess) => {
+    killedProcesses.add(proc);
+    try { proc.kill('SIGKILL'); } catch (e) {}
+};
+
 const getCompiledEncoders = (): Promise<Set<string>> => {
     return new Promise((resolve) => {
         if (availableEncoders) return resolve(availableEncoders);
-        ffmpeg.getAvailableEncoders((err, encoders) => {
-            if (err || !encoders) {
+        cp.execFile(getFfmpegPath(), ['-hide_banner', '-encoders'], { timeout: 5000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+            if (err || !stdout) {
                 console.error('인코더 목록 조회 실패:', err?.message);
                 return resolve(new Set());
             }
-            availableEncoders = new Set(Object.keys(encoders));
+            const parsed = new Set<string>();
+            for (const line of stdout.split(/\r?\n/)) {
+                const match = /^\s*[VAS\.][F\.][S\.][X\.][B\.][D\.]\s+([^\s]+)\s/.exec(line);
+                if (match) parsed.add(match[1]);
+            }
+            availableEncoders = parsed;
             resolve(availableEncoders);
         });
     });
@@ -312,7 +318,7 @@ const cleanupStream = (id: string, quality?: string, deleteFiles: boolean = true
         if (!stream) continue;
         if (stream.command) {
             if (!quality) console.log(`🛑 [ID: ${id}] 자원 확보를 위해 기존 인코더 프로세스 강제 종료: ${key}`);
-            stream.command.kill('SIGKILL');
+            killEncoderProcess(stream.command);
             delete stream.command;
             stoppedAny = true;
         }
@@ -859,7 +865,7 @@ router.get('/hls/:id/:quality/:file', async (req, res) => {
 
         if (!isSequential && activeStreams[streamKey]?.command) {
             console.log(`🚀 탐색 감지됨: 기존 인코더 종료 및 seq=${seq} 부터 재시작`);
-            activeStreams[streamKey].command.kill('SIGKILL');
+            killEncoderProcess(activeStreams[streamKey].command);
             delete activeStreams[streamKey].command;
             activeStreams[streamKey].launching = false;
             activeStreams[streamKey].coldStart = false;
@@ -955,35 +961,63 @@ router.get('/hls/:id/:quality/:file', async (req, res) => {
                         if (targetVCodec === 'libx264') outputOptions.push('-profile:v', 'high');
                     }
 
-                    const command = ffmpeg(video.file_path)
-                        .inputOptions(inputOptions)
-                        .outputOptions(outputOptions)
-                        .output(path.join(outDir, 'dummy.m3u8'))
-                        .on('start', (cmd) => console.log(`✅ [${quality}] 실행 명령어:`, cmd))
-                        .on('stderr', (stderr) => {
-                            const lowerStderr = stderr.toLowerCase();
-                            if (lowerStderr.includes('error') && !lowerStderr.includes('configuration:') && !lowerStderr.includes('hwaccel initialisation returned error')) {
-                                console.error(`❌ [${quality}] FFmpeg 에러:`, stderr);
-                            }
-                        })
-                        .on('error', (err) => {
-                            const isKilled = err.message.includes('SIGKILL');
-                            if (!isKilled) console.error(`❌ [${quality}] 인코딩 실패 (${targetVCodec}):`, err.message);
-                            if (activeStreams[streamKey]?.command === command) {
-                                delete activeStreams[streamKey].command;
-                                if (!isKilled && allowFallback && targetVCodec !== 'libx264' && targetVCodec !== 'copy' && !fs.existsSync(filePath)) {
-                                    console.warn(`⚠️ [ID: ${id}] 하드웨어 인코더(${targetVCodec}) 런타임 실패로 libx264로 자동 폴백합니다.`);
-                                    launchEncoder('libx264', false);
-                                }
-                            }
-                        })
-                        .on('end', () => console.log(`✅ [ID: ${id}] ${quality} 전체 인코딩 완료`));
+                    const ffmpegBin = getFfmpegPath();
+                    const args = [
+                        '-hide_banner',
+                        '-y',
+                        ...inputOptions,
+                        '-i', video.file_path,
+                        ...outputOptions,
+                        path.join(outDir, 'dummy.m3u8'),
+                    ];
 
-                    activeStreams[streamKey].command = command;
+                    const proc = cp.spawn(ffmpegBin, args, {
+                        stdio: ['ignore', 'ignore', 'pipe'],
+                        windowsHide: true,
+                    });
+
+                    console.log(`✅ [${quality}] 실행 명령어:`, `${ffmpegBin} ${args.join(' ')}`);
+
+                    let lastStderrLine = '';
+                    proc.stderr?.on('data', (chunk: Buffer) => {
+                        const text = chunk.toString();
+                        for (const line of text.split(/\r?\n/)) {
+                            const trimmed = line.trim();
+                            if (!trimmed) continue;
+                            lastStderrLine = trimmed;
+                            const lower = trimmed.toLowerCase();
+                            if (lower.includes('error') && !lower.includes('configuration:') && !lower.includes('hwaccel initialisation returned error')) {
+                                console.error(`❌ [${quality}] FFmpeg 에러:`, trimmed);
+                            }
+                        }
+                    });
+
+                    const handleFailure = (reason: string, isKilled: boolean) => {
+                        if (!isKilled) console.error(`❌ [${quality}] 인코딩 실패 (${targetVCodec}):`, reason);
+                        if (activeStreams[streamKey]?.command === proc) {
+                            delete activeStreams[streamKey].command;
+                            if (!isKilled && allowFallback && targetVCodec !== 'libx264' && targetVCodec !== 'copy' && !fs.existsSync(filePath)) {
+                                console.warn(`⚠️ [ID: ${id}] 하드웨어 인코더(${targetVCodec}) 런타임 실패로 libx264로 자동 폴백합니다.`);
+                                launchEncoder('libx264', false);
+                            }
+                        }
+                    };
+
+                    proc.on('error', (err) => handleFailure(err.message, killedProcesses.has(proc)));
+                    proc.on('close', (code, signal) => {
+                        if (code === 0) {
+                            if (activeStreams[streamKey]?.command === proc) delete activeStreams[streamKey].command;
+                            console.log(`✅ [ID: ${id}] ${quality} 전체 인코딩 완료`);
+                        } else {
+                            const isKilled = killedProcesses.has(proc) || signal === 'SIGKILL';
+                            handleFailure(lastStderrLine || `exit code ${code} (signal: ${signal || 'none'})`, isKilled);
+                        }
+                    });
+
+                    activeStreams[streamKey].command = proc;
                     activeStreams[streamKey].currentSeq = seq;
                     activeStreams[streamKey].startTime = Date.now();
                     activeStreams[streamKey].launching = false;
-                    command.run();
                 };
 
                 launchEncoder(vCodec, true);

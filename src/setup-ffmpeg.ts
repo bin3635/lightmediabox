@@ -522,11 +522,6 @@ export const updateFfmpeg = async (): Promise<{ success: boolean; message: strin
         resolvedFfmpegPath = localFfmpeg;
         resolvedFfprobePath = localFfprobe;
 
-        try {
-            const fluentFfmpeg = require('fluent-ffmpeg');
-            fluentFfmpeg.setFfmpegPath(localFfmpeg);
-            fluentFfmpeg.setFfprobePath(localFfprobe);
-        } catch (e) { }
 
         // 임시 정리
         if (fs.existsSync(extractTempPath)) fs.rmSync(extractTempPath, { recursive: true, force: true });
