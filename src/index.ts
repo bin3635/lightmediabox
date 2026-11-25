@@ -2,6 +2,7 @@ import express from 'express';
 import session from 'express-session';
 import crypto from 'crypto';
 import path from 'path';
+import fs from 'fs';
 import './db'; // 임포트하는 순간 내부의 db.exec()가 실행되어 테이블이 생성됨
 import { startScanner } from './scanner';
 import routes from './routes';
@@ -60,28 +61,67 @@ app.use('/api', (req, res, next) => {
     return res.status(401).json({ error: '인증이 필요합니다.' });
 });
 
-// index.html은 항상 최신 상태를 받아야 그 안의 main.js?v=N / styles.css?v=N 링크가
-// 최신 버전을 가리킬 수 있음(iOS Safari가 유독 정적 파일 캐시를 공격적으로 유지해
-// 배포 후에도 예전 CSS/JS가 계속 표시되는 문제가 반복됐음). 반대로 main.js/styles.css는
-// 내용이 바뀔 때마다 우리가 수동으로 ?v=N 쿼리를 올려 URL 자체를 바꾸므로, 특정 버전의
-// 내용은 영원히 바뀌지 않는다는 게 보장됨 — 그래서 영구 캐시해도 안전하고, 오히려 이렇게
-// 해야 배포 후에도 사용자가 수동으로 캐시를 지울 필요 없이 항상 최신 파일을 받게 된다.
-app.use(express.static(path.join(process.cwd(), 'public'), {
+const PUBLIC_DIR = path.join(process.cwd(), 'public');
+const assetHashCache = new Map<string, { mtimeMs: number; size: number; hash: string }>();
+let cachedIndexHtml: { mtimeMs: number; size: number; content: string } | null = null;
+
+const getAssetHash = (fileName: string): string => {
+    try {
+        const filePath = path.join(PUBLIC_DIR, fileName);
+        const stat = fs.statSync(filePath);
+        const cached = assetHashCache.get(fileName);
+        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+            return cached.hash;
+        }
+        const hash = crypto
+            .createHash('sha256')
+            .update(fs.readFileSync(filePath))
+            .digest('hex')
+            .slice(0, 8);
+        assetHashCache.set(fileName, { mtimeMs: stat.mtimeMs, size: stat.size, hash });
+        return hash;
+    } catch {
+        return '0';
+    }
+};
+
+const getIndexHtmlWithAssetHashes = (): string => {
+    const indexPath = path.join(PUBLIC_DIR, 'index.html');
+    const stat = fs.statSync(indexPath);
+    if (!cachedIndexHtml || cachedIndexHtml.mtimeMs !== stat.mtimeMs || cachedIndexHtml.size !== stat.size) {
+        cachedIndexHtml = { mtimeMs: stat.mtimeMs, size: stat.size, content: fs.readFileSync(indexPath, 'utf8') };
+    }
+    const cssHash = getAssetHash('styles.css');
+    const jsHash = getAssetHash('main.js');
+    return cachedIndexHtml.content
+        .replace(/href="styles\.css(?:\?v=[^"]*)?"/, `href="styles.css?v=${cssHash}"`)
+        .replace(/src="main\.js(?:\?v=[^"]*)?"/, `src="main.js?v=${jsHash}"`);
+};
+
+// index.html은 항상 최신 상태로 서빙하면서 main.js / styles.css의 실제 파일 내용 해시를
+// ?v=<hash>로 자동 주입한다. 내용이 바뀔 때만 URL이 자동으로 달라지므로 수동 버전 관리 없이도
+// iOS Safari 등에서 안전하게 영구 캐시(immutable)와 즉시 업데이트를 동시에 달성할 수 있다.
+app.get(['/', '/index.html'], (req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.send(getIndexHtmlWithAssetHashes());
+});
+
+app.use(express.static(PUBLIC_DIR, {
+    index: false,
     setHeaders: (res, filePath) => {
-        if (filePath.endsWith('index.html')) {
-            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-        } else if (filePath.endsWith('main.js') || filePath.endsWith('styles.css')) {
-            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+        if (filePath.endsWith('main.js') || filePath.endsWith('styles.css')) {
+            const hasVersionQuery = Boolean(res.req?.url && res.req.url.includes('?v='));
+            res.setHeader(
+                'Cache-Control',
+                hasVersionQuery ? 'public, max-age=31536000, immutable' : 'no-cache'
+            );
         }
     }
 }));
 
 // 일반 API 라우터 등록
 app.use('/api', routes);
-
-app.get('/', (req, res) => {
-    res.send('LightMediaBox HLS Server is running! 영상을 보려면 /api/videos 를 확인하세요.');
-});
 
 // ffmpeg 설정 후 서버 시작
 setupFfmpeg().then(() => {

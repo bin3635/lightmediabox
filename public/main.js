@@ -1437,6 +1437,10 @@ async function loadTranscoderSettings() {
             if (gpuInfo.tagName === 'INPUT') gpuInfo.value = '불러오기 실패';
             else gpuInfo.innerText = '불러오기 실패';
         }
+        document.querySelectorAll('#transcoder-encoder-list .encoder-status-badge').forEach(badge => {
+            badge.className = 'encoder-status-badge badge-unavailable';
+            badge.innerText = '확인 실패';
+        });
     }
 }
 
